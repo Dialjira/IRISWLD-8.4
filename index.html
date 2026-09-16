@@ -414,6 +414,17 @@ section[data-tab].show{display:block}
 
 <!-- DIAGNÓSTICO DEL WEBSOCKET -->
 <section data-tab="ajustes">
+  <div class="shead"><span class="n">16a</span><h2>Almacenamiento</h2></div>
+  <p class="lede">Si la app «se reinicia sola», aquí está la respuesta. Esta sección mide si el
+  navegador guarda de verdad, cuánto ocupa cada cosa y qué se puede podar.</p>
+  <div class="bar">
+    <button id="almRefresh">Medir almacenamiento</button>
+    <button id="almPodar">Podar historial</button>
+  </div>
+  <div id="almBox"></div>
+</section>
+
+<section data-tab="ajustes">
   <div class="shead"><span class="n">16e</span><h2>Diagnóstico del WebSocket</h2></div>
   <p class="lede">Si el REST funciona y el socket no, el problema es el host o la red, no Binance.
   Esto prueba cinco endpoints uno a uno y mide cuál abre y cuál llega a mandar datos. Los de
@@ -1001,17 +1012,66 @@ async function get(base,path){const r=await fetch(base+path,{cache:"no-store"});
    lo ya borrado. */
 const mem={};
 let storeFrozen=false;
+let storePodando=false;
+
+/* Tamaño real de cada clave, en bytes. Sin esto no hay forma de saber qué está
+   llenando el almacenamiento. */
+function bytesPorClave(){
+  const out={};
+  try{for(let i=0;i<localStorage.length;i++){
+    const k=localStorage.key(i);
+    if(k&&k.startsWith("iris2."))out[k.slice(6)]=k.length+(localStorage.getItem(k)||"").length;}}
+  catch(e){}
+  return out;}
+
+/* Poda por orden de sacrificio: primero lo que se puede regenerar o mirar en
+   otro sitio, nunca la configuración ni las claves. Devuelve KB liberados. */
+const ORDEN_PODA=[
+  ["chat",         t=>[]],
+  ["gemHist",      t=>Array.isArray(t)?t.slice(0,8):t],
+  ["gemTrades",    t=>Array.isArray(t)?t.slice(0,40):t],
+  ["labHist",      t=>Array.isArray(t)?t.slice(0,5):t],
+  ["mejoras",      t=>Array.isArray(t)?t.slice(0,20):t],
+  ["planPending",  t=>Array.isArray(t)?t.slice(-60):t],
+  ["cal",          t=>t&&Array.isArray(t.zlog)?{...t,zlog:t.zlog.slice(-1200)}:t]];
+
+function podarAlmacen(){
+  if(storePodando)return 0;
+  storePodando=true;
+  const antes=Object.values(bytesPorClave()).reduce((a,b)=>a+b,0);
+  try{
+    for(const [clave,recorte] of ORDEN_PODA){
+      let v; try{v=JSON.parse(localStorage.getItem("iris2."+clave));}catch(e){continue;}
+      if(v===null||v===undefined)continue;
+      const nuevo=recorte(v);
+      try{localStorage.setItem("iris2."+clave,JSON.stringify(nuevo)); mem[clave]=nuevo;}catch(e){}
+      const ahora=Object.values(bytesPorClave()).reduce((a,b)=>a+b,0);
+      if(antes-ahora>150000)break;      // con 150 KB liberados basta para seguir
+    }}
+  finally{storePodando=false;}
+  const despues=Object.values(bytesPorClave()).reduce((a,b)=>a+b,0);
+  return Math.round((antes-despues)/1024);}
 const store={
   get(k,d){ if(k in mem)return mem[k];
     try{const v=localStorage.getItem("iris2."+k); if(v===null)return d;
       const p=JSON.parse(v); mem[k]=p; return p;}catch(e){return d;} },
   set(k,v){ if(storeFrozen)return; mem[k]=v;
-    /* Antes el fallo se tragaba entero: si el almacenamiento está lleno o
-       bloqueado, todo vivía solo en memoria y al cerrar la app se perdía sin
-       un solo aviso. Ahora queda registrado y el verificador lo canta. */
-    try{ localStorage.setItem("iris2."+k,JSON.stringify(v)); S.storeOk=true; }
-    catch(e){ S.storeFallo={clave:k, motivo:e&&e.name||"desconocido", t:Date.now(),
-      n:((S.storeFallo&&S.storeFallo.n)||0)+1}; } },
+    /* Registrarlo no bastaba: el fallo quedaba anotado y el guardado seguía sin
+       ocurrir, así que todo vivía en memoria y desaparecía en la siguiente
+       recarga. Si el motivo es la cuota, ahora se poda lo más pesado y se
+       reintenta UNA vez. Un historial viejo vale menos que la configuración. */
+    try{ localStorage.setItem("iris2."+k,JSON.stringify(v)); S.storeOk=true; return; }
+    catch(e){
+      const cuota=/quota|exceed/i.test((e&&e.name||"")+(e&&e.message||""));
+      if(cuota&&!storePodando){
+        const liberado=podarAlmacen();
+        try{ localStorage.setItem("iris2."+k,JSON.stringify(v)); S.storeOk=true;
+          addLog(`<b>Almacenamiento lleno.</b> Se podaron ${liberado} KB de historial `+
+            `para poder seguir guardando. Exporta una copia si querías conservarlo.`);
+          return; }
+        catch(e2){}}
+      S.storeFallo={clave:k, motivo:e&&e.name||"desconocido", t:Date.now(),
+        cuota, n:((S.storeFallo&&S.storeFallo.n)||0)+1}; } },
   del(k){ delete mem[k];
     try{localStorage.removeItem("iris2."+k);}catch(e){} },
   bytes(){ let n=0;
@@ -9758,6 +9818,44 @@ function avisoParMarginal(){
     `Con tan pocas operaciones, el flujo llega a cuentagotas y varias capas del motor `+
     `trabajan con muestra mínima. Para análisis, WLDUSDT da una lectura más fiable.`);}
 
+function renderAlmacen(){
+  const box=$("almBox"); if(!box)return;
+  const p=S.persist||{};
+  const tabla=bytesPorClave();
+  const total=Object.values(tabla).reduce((a,b)=>a+b,0);
+  const filas=Object.entries(tabla).sort((a,b)=>b[1]-a[1]).slice(0,14);
+  const podables=new Set(ORDEN_PODA.map(x=>x[0]));
+  const critico=p.roto||p.escritura===false;
+  box.innerHTML=`
+    <div class="${critico?"warnbox":"okbox"}">
+      <b>${critico?"El almacenamiento NO está persistiendo.":"Persistencia correcta."}</b><br>
+      ${p.veredicto||""}<br>
+      Origen: <b>${p.origen||"desconocido"}</b> · escritura ${p.escritura?"sí":"NO"} ·
+      arranques registrados ${S.arranques}
+      ${p.marcaPrevia?`· última sesión vista ${p.marcaPrevia}`:""}
+      ${critico?`<br><br><b>Qué hacer:</b> si el origen empieza por <b>content:</b>, <b>file:</b> o
+        <b>blob:</b>, estás abriendo una copia local y Android le da un origen distinto en cada
+        apertura: todo se pierde por diseño. Abre siempre la versión publicada en https.
+        Si el origen ya es https y aun así no persiste, revisa que Chrome no esté en incógnito y
+        que no tenga activado borrar datos de sitios al cerrar.`:""}
+    </div>
+    <div class="grid2">
+      <div class="cell"><div class="k">Ocupado</div><div class="v">${(total/1024).toFixed(1)} KB</div></div>
+      <div class="cell"><div class="k">Claves</div><div class="v">${Object.keys(tabla).length}</div></div>
+      <div class="cell"><div class="k">Fallos de guardado</div>
+        <div class="v" style="color:${S.storeFallo?"var(--rose)":"var(--green)"}">${S.storeFallo?S.storeFallo.n:0}</div></div>
+      <div class="cell"><div class="k">Último fallo</div>
+        <div class="v">${S.storeFallo?S.storeFallo.motivo:"—"}</div></div>
+    </div>
+    <div style="overflow-x:auto"><table class="tbl">
+      <thead><tr><th>Clave</th><th>KB</th><th>Podable</th></tr></thead>
+      <tbody>${filas.map(([k,v])=>`<tr><td class="mono">${k}</td>
+        <td>${(v/1024).toFixed(1)}</td>
+        <td>${podables.has(k)?"sí":"—"}</td></tr>`).join("")}</tbody></table></div>
+    <div class="note">El límite típico de un navegador ronda los 5 MB por origen. Cuando se llena,
+      la app poda sola el historial más viejo para poder seguir guardando la configuración, y te
+      avisa en la bitácora. La configuración, las claves y la calibración nunca se podan.</div>`;}
+
 function renderBf(){
   const box=$("bfBox"); if(!box)return;
   const d=S.bf, x=S.cruzada;
@@ -9836,7 +9934,17 @@ $("wsDiagReset").onclick=()=>{
 window.renderDiario=renderDiario;
 window.borrarStatsModelos=borrarStatsModelos;
 window.renderModelStats=renderModelStats;
-renderGuia(); renderBf(); renderDiario(); renderModelStats();
+window.renderAlmacen=renderAlmacen;
+renderGuia(); renderBf(); renderDiario(); renderModelStats(); renderAlmacen();
+$("almRefresh").onclick=()=>{renderAlmacen(); addLog("Almacenamiento medido.");};
+$("almPodar").onclick=()=>{
+  const kb=podarAlmacen(); renderAlmacen();
+  addLog(kb>0?`<b>Poda manual:</b> ${kb} KB liberados del historial más viejo.`
+            :"No había nada que podar.");};
+/* Si la persistencia está rota, que se vea nada más abrir y no enterrado en Ajustes */
+if(S.persist&&(S.persist.roto||S.persist.escritura===false))
+  addLog(`<b style="color:var(--rose)">El almacenamiento no persiste.</b> ${S.persist.veredicto} `+
+    `Origen: ${S.persist.origen||"desconocido"}. Mira la sección 16a · Almacenamiento.`);
 
 /* ── Backfill ── */
 $("bfRun").onclick=async()=>{
@@ -10020,8 +10128,37 @@ document.addEventListener("visibilitychange",()=>{if(!document.hidden)fullRefres
      desaparezca. Se detecta contando arranques: si siempre vuelve a 1, no
      está persistiendo nada. */
   sanearPerfiles();
+  /* ══ SONDA DE PERSISTENCIA ══
+     Contar arranques no basta: si el almacenamiento no sobrevive, el contador
+     tampoco, y siempre vale 1 sin que eso se distinga de un primer uso real.
+     Esta sonda escribe una marca y en el siguiente arranque comprueba si sigue
+     ahí. Es la única prueba directa de si el navegador está guardando algo.
+     Se hace ANTES de tocar nada más, porque de esto depende que el resto
+     signifique algo. */
+  (function sondaPersistencia(){
+    let escrituraOk=false;
+    try{ localStorage.setItem("iris2.sonda","1"); escrituraOk=localStorage.getItem("iris2.sonda")==="1"; }
+    catch(e){ escrituraOk=false; }
+    const marca=store.get("persistPing",null);
+    store.set("persistPing",{t:Date.now(),v:8.4});
+    S.persist={
+      escritura:escrituraOk,
+      marcaPrevia:marca?new Date(marca.t).toLocaleString():null,
+      sobrevive:!!marca,
+      origen:origenApp()};
+    if(!escrituraOk)
+      S.persist.veredicto="El navegador RECHAZA escribir. Nada se va a guardar en esta sesión.";
+    else if(!marca)
+      S.persist.veredicto="Primera vez en este origen, o el almacenamiento se borra al cerrar.";
+    else
+      S.persist.veredicto="El almacenamiento persiste correctamente.";})();
   S.arranques=store.get("arranques",0)+1;
   store.set("arranques",S.arranques);
+  /* Si ya hubo arranques previos y la marca no estaba, la prueba es concluyente */
+  if(S.arranques>1&&S.persist&&!S.persist.sobrevive){
+    S.persist.roto=true;
+    S.persist.veredicto="CONFIRMADO: el almacenamiento NO sobrevive a recargar. "+
+      "Se escribe bien dentro de la sesión y desaparece al volver a abrir.";}
   S.primerUso=store.get("primerUso",null);
   if(!S.primerUso){S.primerUso=Date.now(); store.set("primerUso",S.primerUso);}
   S.gemHist=store.get("gemHist",[]);
