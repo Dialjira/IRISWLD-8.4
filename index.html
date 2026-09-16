@@ -8635,6 +8635,7 @@ function buildAuditPayload(){
     comparacion_del_filtro:compararFiltro(),
     diagnostico:{ok:S.diag.ok,items:S.diag.items,excepciones:S.diag.errs},
     ingesta:{fuente_flujo:S.restFlow.activo?"rest_degradado":(S.wsState.fuente||"ninguna"),
+      configuracion_modificada:diffConfig().map(x=>`${x.ruta}: ${x.fabrica}→${x.ahora}`),
       ws_estado:S.wsState.estado, ws_mensajes:S.wsState.msgs,
       ws_mensajes_por_tipo:S.wsState.porTipo||{},
       ws_segundos_desde_el_ultimo:S.wsState.ultimoMsg
@@ -9361,6 +9362,26 @@ function validarEntradasIA(d){
    salto propuesto no supere el 30%. Corrige el informe a la vista. */
 /* Escribe una ruta de CFG. Solo acepta rutas de la lista ajustable y valores
    numéricos finitos: el resto se rechaza aquí, no más abajo. */
+/* ══ HUELLA DE CONFIGURACIÓN ══
+   Foto de los valores de fábrica, tomada antes de que nada los toque. Sirve
+   para responder de un vistazo la única pregunta que importa cuando algo
+   parece revertido: ¿el motor está usando mis valores o los de fábrica?
+   El número que ves en la guía NO es decorativo: sale de leerRuta(CFG, ...),
+   o sea del mismo objeto que consulta el motor en cada cálculo. Si ahí pone
+   0.15, el motor está usando 0.15. */
+const CFG_FABRICA=(()=>{const f={};
+  for(const [ruta] of RUTAS_AJUSTABLES)f[ruta]=leerRuta(CFG,ruta);
+  return f;})();
+
+function diffConfig(){
+  const out=[];
+  for(const [ruta,desc] of RUTAS_AJUSTABLES){
+    const ahora=leerRuta(CFG,ruta), fab=CFG_FABRICA[ruta];
+    if(Number.isFinite(ahora)&&Number.isFinite(fab)&&Math.abs(ahora-fab)>1e-9)
+      out.push({ruta,desc,fabrica:fab,ahora,
+        pct:+(((ahora-fab)/Math.abs(fab||1))*100).toFixed(1)});}
+  return out;}
+
 function escribirRuta(ruta,valor){
   if(!RUTAS_AJUSTABLES.some(r=>r[0]===ruta))return false;
   const v=+valor; if(!Number.isFinite(v))return false;
@@ -9852,6 +9873,25 @@ function renderAlmacen(){
       <tbody>${filas.map(([k,v])=>`<tr><td class="mono">${k}</td>
         <td>${(v/1024).toFixed(1)}</td>
         <td>${podables.has(k)?"sí":"—"}</td></tr>`).join("")}</tbody></table></div>
+    ${(()=>{const d=diffConfig();
+      const guardados=Object.keys(store.get("cfgAjustes",{})).length;
+      return `<h3 style="margin:14px 0 6px;font-size:13px">Configuración efectiva contra fábrica</h3>
+      ${d.length
+        ? `<div class="okbox">El motor está usando <b>${d.length} ${d.length===1?"valor propio":"valores propios"}</b>,
+           no los de fábrica. Esto se lee del objeto de configuración vivo, el mismo que consulta
+           el motor en cada cálculo: si aparece aquí, está en uso.</div>
+           <div style="overflow-x:auto"><table class="tbl">
+           <thead><tr><th>Parámetro</th><th>Fábrica</th><th>Ahora</th><th>Δ</th></tr></thead>
+           <tbody>${d.map(x=>`<tr><td class="mono">${x.ruta}</td><td>${x.fabrica}</td>
+             <td><b>${x.ahora}</b></td>
+             <td class="${x.pct>0?"pos":"neg"}">${x.pct>0?"+":""}${x.pct}%</td></tr>`).join("")}</tbody>
+           </table></div>`
+        : `<div class="${guardados?"warnbox":"note"}">El motor está con <b>todos los valores de
+           fábrica</b>. ${guardados
+             ? `Y sin embargo hay <b>${guardados}</b> ajuste(s) guardados que no se aplicaron:
+                eso es un fallo real, avísame.`
+             : `Si esperabas ver aquí algún cambio tuyo, es que no llegó a guardarse: revisa el
+                recuadro de persistencia de arriba.`}</div>`}`;})()}
     <div class="note">El límite típico de un navegador ronda los 5 MB por origen. Cuando se llena,
       la app poda sola el historial más viejo para poder seguir guardando la configuración, y te
       avisa en la bitácora. La configuración, las claves y la calibración nunca se podan.</div>`;}
