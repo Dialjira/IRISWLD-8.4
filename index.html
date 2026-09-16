@@ -10226,7 +10226,23 @@ document.addEventListener("visibilitychange",()=>{if(!document.hidden)fullRefres
     for(const ruta of rutasAj)if(escribirRuta(ruta,aj[ruta]))puestos++;
     addLog(`<b>Ajustes manuales restaurados</b> · ${puestos} de ${rutasAj.length}: `+
       rutasAj.map(r=>`${r}=${aj[r]}`).join(", "));}
+  /* BUG CORREGIDO · la guía se pintaba con los valores de fábrica aunque el
+     motor ya tuviera los tuyos.
+     Las llamadas a renderGuia, renderAlmacen y compañía viven al final del
+     script y se ejecutan ANTES de que init() restaure cfgAjustes. Resultado:
+     el panel mostraba 0.15 mientras CFG ya valía 0.191784. Al pulsar «+ subir»
+     el paso se calculaba sobre el valor REAL, así que saltaba a 0.210962 y
+     parecía que el botón se volvía loco. No lo estaba: la pantalla mentía y el
+     motor tenía razón.
+     La persistencia funcionaba. Lo que fallaba era el orden de pintado. */
+  try{ if(typeof renderGuia==="function")renderGuia();
+       if(typeof renderAlmacen==="function")renderAlmacen(); }catch(e){}
   $("f_maxlev").value=String(CFG.maxLev);
+  /* Segunda pasada: cualquier panel que dependa de CFG o del estado cargado se
+     repinta cuando init ya ha terminado de restaurar. Pintar una vez al cargar
+     el script no basta, porque en ese momento no hay nada restaurado todavía. */
+  for(const fn of ["renderGuia","renderAlmacen","renderBf","renderDiario","renderModelStats"])
+    try{ if(typeof window[fn]==="function")window[fn](); }catch(e){}
   $("symSel").value=S.sym; $("tfSel").value=S.tf;
   setTab(store.get("tab","mesa"));
   document.querySelectorAll("#horizonSeg button").forEach(b=>
