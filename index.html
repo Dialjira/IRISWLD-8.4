@@ -358,6 +358,7 @@ section[data-tab].show{display:block}
   <div class="bar" style="margin-top:10px">
     <input id="gemAsk" placeholder="¿Qué le pregunto? Escribe aquí…" style="flex:1 1 200px">
     <button id="gemAskBtn">Preguntar</button>
+    <button id="gemCancel" style="display:none;color:var(--rose)">Cancelar</button>
     <button id="chatClear">Vaciar</button>
   </div>
   <div id="chatStatus" class="note" style="display:none"></div>
@@ -3848,6 +3849,30 @@ async function backfill(sym,tf,objetivo){
   const nombres=Object.keys(CFG.blocks).filter(b=>b!=="flow");
   const bloques={}; nombres.forEach(b=>bloques[b]={n:0,hit:0});
   const zlog=[]; let n=0,hits=0,brier=0;
+  /* ══ PRUEBAS DE CONTROL ══
+     Un acierto por debajo del azar con muestra grande tiene cuatro causas
+     posibles y desde fuera no se distinguen. Estos contadores las separan en
+     una sola pasada, sin pedirle al usuario que adivine:
+     · invertido  → si acertar al revés da >52%, el signo está del revés o la
+                    capa técnica es contraria en este marco.
+     · retrasado  → usar la señal de la vela ANTERIOR. Si mejora mucho, hay un
+                    desfase de una vela entre señal y resolución.
+     · siempre_largo → la deriva del propio activo. Si el activo subió el 55%
+                    de las ventanas, un 47,7% direccional puede ser solo estar
+                    corto en un mercado alcista, no una señal mala.
+     · horizontes → si el acierto cruza el 50% al alargar el plazo, la señal es
+                    de reversión a corto y de continuación a medio, que es un
+                    hallazgo, no una avería. */
+  let hitsInv=0, hitsLag=0, nLag=0, hitsLargo=0;
+  /* s = múltiplo de ATR del stop · t = del objetivo · h = factor sobre el plazo */
+  const GEOMETRIAS=[];
+  for(const st of [0.7,1,1.5,2.5])
+    for(const tg of [1,1.5,2,3])
+      for(const hh of [1,2])
+        GEOMETRIAS.push({s:st,t:tg,h:hh});
+  const horizontes={}, hz=[1,Math.max(2,Math.round(barras/2)),barras,barras*2,barras*4];
+  for(const h of hz)horizontes[h]={n:0,hit:0};
+  let zPrev=null;
   const rs=[]; let rSum=0,rN=0,rBrutaSum=0;
   const K=CFG.costes;
 
@@ -3871,13 +3896,57 @@ async function backfill(sym,tf,objetivo){
     const mov=(fut.c-k[i].c)/k[i].c;
     if(!Number.isFinite(mov))continue;
     const up=mov>0?1:0;
-    n++; if(Math.sign(z)===Math.sign(mov))hits++;
+    n++;
+    const acierta=Math.sign(z)===Math.sign(mov);
+    if(acierta)hits++; else hitsInv++;
+    if(mov>0)hitsLargo++;
+    if(zPrev!==null){nLag++; if(Math.sign(zPrev)===Math.sign(mov))hitsLag++;}
+    zPrev=z;
+    for(const h of hz){
+      const f2=k[i+h];
+      if(!f2)continue;
+      const m2=(f2.c-k[i].c)/k[i].c;
+      if(!Number.isFinite(m2)||m2===0)continue;
+      horizontes[h].n++; if(Math.sign(z)===Math.sign(m2))horizontes[h].hit++;}
     brier+=(prob-up)**2;
     zlog.push([z,up]);
     for(const b of nombres){
       const v=sc.blocks[b];
       if(!Number.isFinite(v))continue;
       bloques[b].n++; if(Math.sign(v)===Math.sign(mov))bloques[b].hit++;}
+
+    /* ══ BARRIDO DE GEOMETRÍA ══
+       El backfill probaba UNA sola geometría: stop a 1 ATR, objetivo a rrMin
+       ATR, plazo fijo. Si esa combinación pierde, no dice si pierde la señal o
+       pierde la forma del plan. Con un objetivo a 2 ATR hace falta acertar el
+       33,3% para empatar en bruto; si el stop a 1 ATR se barre antes, no
+       importa lo buena que sea la dirección.
+       Aquí se recorre la misma historia con varias combinaciones de stop,
+       objetivo y plazo, y se ordena por R NETA. Responde de una vez si existe
+       alguna geometría rentable con esta señal, o si no la hay con ninguna. */
+    if(Number.isFinite(o.atr)&&o.atr>0){
+      const A2=o.atr, e2=k[i].c;
+      for(const g of GEOMETRIAS){
+        const st=e2-dir*A2*g.s, tg=e2+dir*A2*g.t;
+        const lim=Math.min(k.length-1,i+Math.round(barras*g.h));
+        let res2=null;
+        for(let j=i+1;j<=lim;j++){
+          const c=k[j];
+          const hT=dir===1?c.h>=tg:c.l<=tg, hS=dir===1?c.l<=st:c.h>=st;
+          if(hT&&hS){res2=0;break;}
+          if(hT){res2=1;break;}
+          if(hS){res2=0;break;}}
+        if(res2===null){
+          /* vencimiento por tiempo: se liquida a mercado, no se ignora */
+          const cierre=k[lim].c;
+          res2=null;
+          const rParcial=((cierre-e2)*dir)/(A2*g.s);
+          g._sum=(g._sum||0)+rParcial-((e2*(K.comisionTaker*2+K.deslizamiento*2))/(A2*g.s));
+          g._n=(g._n||0)+1; g._venc=(g._venc||0)+1; continue;}
+        const rb=res2?g.t/g.s:-1;
+        const cR=(e2*(K.comisionTaker*2+K.deslizamiento*2))/(A2*g.s);
+        g._sum=(g._sum||0)+rb-cR; g._n=(g._n||0)+1;
+        if(res2)g._win=(g._win||0)+1;}}
 
     /* plan sintético con la misma geometría que usa el motor en vivo:
        entrada al cierre, stop a 1 ATR y objetivo a rrMin ATR */
@@ -3899,14 +3968,54 @@ async function backfill(sym,tf,objetivo){
       rSum+=rNeta; rBrutaSum+=rBruta; rN++; rs.push(rNeta);}}
 
   if(n<100)return{error:`Solo ${n} resoluciones evaluables en ${sym} ${tf}.`};
+  /* Veredicto automático: qué explica un acierto por debajo del azar */
+  const pct=x=>+(x*100).toFixed(1);
+  const aInv=hitsInv/n, aLag=nLag?hitsLag/nLag:null, aLargo=hitsLargo/n;
+  const curva=hz.map(h=>({barras:h,n:horizontes[h].n,
+    acierto:horizontes[h].n?+(horizontes[h].hit/horizontes[h].n).toFixed(4):null}))
+    .filter(x=>x.acierto!==null&&x.n>=50);
+  const cruzaArriba=curva.some(x=>x.acierto>0.52), cruzaAbajo=curva.some(x=>x.acierto<0.48);
+  const diag={
+    acierto_directo:pct(hits/n),
+    acierto_invertido:pct(aInv),
+    acierto_con_senal_retrasada:aLag===null?null:pct(aLag),
+    acierto_de_comprar_siempre:pct(aLargo),
+    curva_por_horizonte:curva.map(x=>`${x.barras} velas: ${pct(x.acierto)}% (n=${x.n})`),
+    veredicto:
+      aInv>0.54
+        ? "SEÑAL CONTRARIA: acertar al revés supera el 54%. O el signo está invertido en algún "+
+          "punto de la cadena, o la capa técnica es genuinamente contraria en este marco. "+
+          "Lo segundo es explotable; lo primero es un bug. Para distinguirlo mira la curva por "+
+          "horizonte: si TODOS los plazos salen por debajo de 50, huele a signo invertido; si "+
+          "solo los cortos, es reversión a la media."
+      : aLag!==null&&aLag-hits/n>0.04
+        ? "DESFASE DE UNA VELA: la señal de la vela anterior acierta bastante más que la actual. "+
+          "Hay un descuadre entre el momento en que se calcula la señal y el que se resuelve."
+      : Math.abs(aLargo-0.5)>0.06&&Math.abs(hits/n-0.5)<0.03
+        ? `DERIVA DEL ACTIVO: el precio subió en el ${pct(aLargo)}% de las ventanas. Con esa `+
+          `asimetría, un direccional cerca del 50% dice poco: compáralo contra comprar y esperar.`
+      : cruzaArriba&&cruzaAbajo
+        ? "DEPENDE DEL PLAZO: el acierto cruza el 50% según el horizonte. La señal no es mala, "+
+          "está midiéndose en el plazo equivocado. Ajusta el horizonte al que da ventaja."
+      : Math.abs(hits/n-0.5)<0.02
+        ? "SIN VENTAJA DIRECCIONAL: el acierto es indistinguible de una moneda. No es un bug; "+
+          "es que esta capa, sola y en este marco, no predice dirección."
+      : "Sin anomalía estructural detectada en los controles."};
   const media=rSum/rN;
   const sd=Math.sqrt(rs.reduce((a,x)=>a+(x-media)**2,0)/Math.max(1,rN-1));
   return{sym,tf,velas:k.length,
     desde:fechaHora(k[200].t), hasta:fechaHora(k.at(-1).t),
     n, acierto:+(hits/n).toFixed(4), brier:+(brier/n).toFixed(4),
+    diagnostico:diag,
     zlog, barras,
     bloques:nombres.map(b=>({bloque:b,n:bloques[b].n,
       acierto:bloques[b].n?+(bloques[b].hit/bloques[b].n).toFixed(4):null})),
+    geometrias:GEOMETRIAS.filter(g=>g._n>=200)
+      .map(g=>({stop:g.s,objetivo:g.t,plazo:`${g.h}×`,n:g._n,
+        aciertos:g._win?+(g._win/g._n).toFixed(3):0,
+        vencidos:g._venc?+(g._venc/g._n).toFixed(3):0,
+        R_neta:+(g._sum/g._n).toFixed(4)}))
+      .sort((a,b)=>b.R_neta-a.R_neta).slice(0,10),
     planes:{n:rN,
       expectativa_R_neta:+(rSum/rN).toFixed(4),
       expectativa_R_bruta:+(rBrutaSum/rN).toFixed(4),
@@ -4033,6 +4142,14 @@ async function validacionCruzada(tf,pares,velas,progreso){
 /* Siembra explícita: el usuario decide mezclar, y queda marcado el origen. */
 function sembrarCalibracion(bf){
   if(!bf||bf.error||!bf.zlog)return false;
+  /* Sembrar una muestra con el signo del revés corrompe la calibración de
+     Platt en vivo, y es difícil de deshacer porque se mezcla con lo real. */
+  const d=bf.diagnostico;
+  if(d&&/CONTRARIA|DESFASE/.test(d.veredicto)){
+    addLog(`<b style="color:var(--rose)">Siembra bloqueada.</b> Las pruebas de control dicen: `+
+      `${d.veredicto} Sembrar esta muestra metería ese defecto dentro de la calibración en vivo. `+
+      `Resuelve primero qué pasa con el signo o el desfase.`);
+    return false;}
   S.cal.zlog=(S.cal.zlog||[]).concat(bf.zlog).slice(-4000);
   S.cal.backfill={n:bf.n,sym:bf.sym,tf:bf.tf,t:Date.now(),acierto:bf.acierto,brier:bf.brier};
   store.set("cal",S.cal);
@@ -9172,6 +9289,24 @@ async function gemAsk(){
   pintarChat();
   chatEstado("Pensando…");
   gemState.busy=true; $("gemAskBtn").disabled=true;
+  /* RED DE SEGURIDAD · si algo lanza entre aquí y el final, gemState.busy se
+     quedaba en true para siempre y el chat no aceptaba una sola pregunta más:
+     el botón muerto y ningún error a la vista. Este vigilante lo suelta pase
+     lo que pase. */
+  clearTimeout(S.chatVigia);
+  S.chatVigia=setTimeout(()=>{
+    if(gemState.busy){
+      gemState.busy=false;
+      const b=$("gemAskBtn"); if(b)b.disabled=false;
+      const c=$("gemCancel"); if(c)c.style.display="none";
+      chatEstado("La consulta excedió el tiempo previsto y se liberó el chat. "+
+        "Vuelve a preguntar o cambia de modelo en la sección 03.","var(--rose)");
+      addLog("<b>Chat liberado por el vigilante:</b> la consulta no terminó a tiempo.");}
+  },110000);
+  const btnCancel=$("gemCancel");
+  if(btnCancel){btnCancel.style.display=""; btnCancel.onclick=()=>{
+    S.chatCancelado=true;
+    chatEstado("Cancelando… se suelta en cuanto responda el modelo en curso.","var(--amber)");};}
 
   /* La conversación va como turnos reales; el contexto se REGENERA en cada
      pregunta y viaja como primer turno, así nunca se responde con datos
@@ -9182,10 +9317,30 @@ async function gemAsk(){
     "Estado actual del mercado (usa SOLO estas cifras):\n"+JSON.stringify(contextoChat())}]};
   const ack={role:"model",parts:[{text:"Recibido. Dime qué quieres saber."}]};
 
+  /* ══ PRESUPUESTO DE TIEMPO DEL CHAT ══
+     El chat se colgaba y no era un bloqueo: era aritmética. gemCall reintenta
+     3 veces con 90 s de tope y esperas de 1,5+4+9 s, o sea hasta 4,8 minutos
+     POR MODELO; con cinco modelos en la escalera, veinte minutos mirando
+     "Consultando…" sin forma de cancelar. Un informe puede permitirse esa
+     espera; una pregunta de chat no.
+     Ahora hay presupuesto total, menos reintentos y botón de cancelar. */
+  const PRESUPUESTO_MS=75000;
+  const t0=Date.now();
+  const restante=()=>PRESUPUESTO_MS-(Date.now()-t0);
+  S.chatCancelado=false;
   const proveedor=($("iaProveedor")&&$("iaProveedor").value)||"gemini";
   const elegido=$("gemModel").value;
   /* Con Groq como principal, Gemini ni se consulta salvo que Groq falle. */
   const modelos=proveedor==="groq_solo"?[]:modelosDisponibles(elegido);
+  /* Si tu modelo queda fuera por saturación, decirlo: antes desaparecía sin
+     explicación y parecía que la app ignoraba tu elección. */
+  if(elegido&&modelos.length&&idModelo(modelos[0])!==idModelo(elegido)){
+    const p=perfilModelo(idModelo(elegido));
+    const hasta=p&&p.saturadoHasta>Date.now()
+      ?new Date(p.saturadoHasta).toLocaleTimeString():null;
+    addLog(`<b>${idModelo(elegido)}</b> queda fuera de esta consulta`+
+      (hasta?` porque está marcado saturado hasta las ${hasta}`:"")+
+      `. Se usa ${idModelo(modelos[0])}.`);}
   const errores=[];
   let raw=null, modeloUsado=null;
 
@@ -9195,6 +9350,8 @@ async function gemAsk(){
     if(g.ok){raw=g.txt; modeloUsado=g.modelo;}
     else if(g.err)errores.push(g.err);
     if(!raw&&proveedor==="groq_solo"){
+      clearTimeout(S.chatVigia);
+      if($("gemCancel"))$("gemCancel").style.display="none";
       gemState.busy=false; $("gemAskBtn").disabled=false;
       chatEstado(`Groq no respondió. ${errores.join(" · ")}. `+
         `Cambia el proveedor principal en la sección 03 o revisa la clave.`,"var(--rose)");
@@ -9203,14 +9360,23 @@ async function gemAsk(){
      el menos malo en vez de dejar al usuario sin nada */
   let mejor=null;
   for(const modelo of modelos){
+    if(S.chatCancelado){errores.push("cancelado por el usuario"); break;}
+    if(restante()<8000){
+      errores.push(`sin tiempo: ${modelos.length} modelos no caben en ${PRESUPUESTO_MS/1000}s`);
+      break;}
     const gc={temperature:0.35, maxOutputTokens:8192};
     if(/2\.5|thinking/.test(modelo))gc.thinkingConfig={thinkingBudget:0};
     const body={systemInstruction:{parts:[{text:CHAT_SYS}]},
       contents:[ctx,ack,...previos,{role:"user",parts:[{text:q}]}],
       generationConfig:gc};
     try{
-      chatEstado(`Consultando ${modelo}…`);
-      const txt=await gemCall(body,modelo,90000,2);
+      const pos=modelos.indexOf(modelo)+1;
+      const esElegido=idModelo(modelo)===idModelo(elegido);
+      chatEstado(`Consultando ${modelo}…`+(esElegido?" (tu modelo)":` (relevo ${pos} de ${modelos.length})`)
+        +` · ${Math.round(restante()/1000)}s de margen`);
+      /* Un intento por modelo y tope ajustado al margen que queda: es mejor
+         bajar al siguiente modelo que insistir con uno que no responde. */
+      const txt=await gemCall(body,modelo,Math.max(8000,Math.min(40000,restante()-4000)),1);
       guardarPerfil(modelo,{saturadoHasta:0});
       const cal=calidadRespuesta(txt,q);
       anotarModelo(modelo,cal.ok?"ok":"pobre",cal.puntos);
@@ -9237,6 +9403,8 @@ async function gemAsk(){
     else{if(g.err)errores.push(g.err);
       if(g.cal&&(!mejor||g.cal.puntos>mejor.cal.puntos))mejor={txt:g.txt,modelo:g.modelo,cal:g.cal};}}
 
+  clearTimeout(S.chatVigia);
+  if($("gemCancel"))$("gemCancel").style.display="none";
   gemState.busy=false; $("gemAskBtn").disabled=false;
   let aviso="";
   if(raw===null&&mejor){
@@ -9426,7 +9594,7 @@ function validarRecalibraciones(d){
     x.parametro=ruta;
     if(!validas.has(ruta)){
       const real=leerRuta(CFG,ruta);
-      x._invalida=true;
+      x._invalida=true; x._motivo="no_ajustable";
       avisos.push(real===undefined
         ? `Recalibración ${i+1}: <b>${ruta||"(sin ruta)"}</b> no existe en el motor. `+
           `Los parámetros ajustables son los de parametros_ajustables; este se lo inventó.`
@@ -9447,7 +9615,12 @@ function validarRecalibraciones(d){
       const salto=Math.abs(prop-real)/Math.abs(real);
       x._salto=salto;
       if(salto>0.10){
-        x._invalida=true;
+        /* BUG CORREGIDO · marcaba _invalida y la tarjeta mostraba siempre el
+           mismo texto: "no está en la lista de ajustables". Falso y confuso:
+           blocks.flow.w SÍ es ajustable, lo que pasaba es que el salto del 11%
+           supera el tope. Decir el motivo equivocado hace perder el tiempo
+           buscando un problema que no existe. */
+        x._invalida=true; x._motivo="salto";
         avisos.push(`Recalibración ${i+1}: propone mover <b>${ruta}</b> un `+
           `${Math.round(salto*100)}% de golpe (${real} → ${prop}), por encima del 10% permitido `+
           `en una iteración. Un motor se recalibra con pasos pequeños y se mide entre paso y `+
@@ -9614,8 +9787,14 @@ function renderGem(d){
             ${x._salto?`<span class="tag">${Math.round(x._salto*100)}%</span>`:""}</h3>
           ${desc?`<div class="rationale" style="font-size:11.5px">${esc(desc)}</div>`:""}
           ${x._invalida
-            ? `<div class="warnbox">Este parámetro no se puede recalibrar: no está en la lista
-               de ajustables del motor.</div>`
+            ? (x._motivo==="salto"
+              ? `<div class="warnbox">Rechazada por el tope de paso: propone mover
+                 <b>${esc(x.valor_actual)}</b> → <b>${esc(x.valor_propuesto)}</b>, un
+                 ${Math.round((x._salto||0)*100)}% de golpe, y el máximo por ciclo es 10%.
+                 El parámetro sí es ajustable: muévelo tú en Ajustes → Guía de parámetros, un
+                 paso, y mide antes del siguiente.</div>`
+              : `<div class="warnbox">Este parámetro no se puede recalibrar: no está en la lista
+                 de ajustables del motor.</div>`)
             : `<div class="grid2">
                 <div class="cell"><div class="k">Ahora${x._valorInventado!==undefined
                   ?" (corregido)":""}</div><div class="v">${esc(x.valor_actual)}</div></div>
@@ -9916,6 +10095,40 @@ function renderBf(){
         :"La ventaja neta NO se distingue de cero: con esta muestra, el resultado es compatible con el azar."}</div>
       <div style="overflow-x:auto"><table class="tbl"><thead><tr><th>Bloque</th><th>n</th><th>Acierto</th></tr></thead>
       <tbody>${d.bloques.map(b=>`<tr><td>${b.bloque}</td><td>${b.n}</td><td>${b.acierto===null?"—":(b.acierto*100).toFixed(1)+"%"}</td></tr>`).join("")}</tbody></table></div>
+      ${(d.geometrias||[]).length?`<h3 style="margin:12px 0 6px;font-size:13px">Barrido de geometría</h3>
+        <div class="${d.geometrias[0].R_neta>0?"okbox":"warnbox"}">
+          ${d.geometrias[0].R_neta>0
+            ? `<b>Hay geometría rentable.</b> Stop ${d.geometrias[0].stop} ATR, objetivo
+               ${d.geometrias[0].objetivo} ATR, plazo ${d.geometrias[0].plazo}:
+               <b>${d.geometrias[0].R_neta} R netos</b> por operación sobre ${d.geometrias[0].n}
+               casos. Antes de creértelo, compruébalo en validación cruzada: una combinación
+               ganadora entre 32 probadas puede ser casualidad.`
+            : `<b>Ninguna de las 32 geometrías da R neta positiva.</b> La mejor pierde
+               ${d.geometrias[0].R_neta} R. Con esta señal no hay forma de colocar stop y objetivo
+               que gane: el problema no es la forma del plan, es que no hay ventaja direccional
+               que explotar.`}</div>
+        <div style="overflow-x:auto"><table class="tbl">
+        <thead><tr><th>Stop</th><th>Obj.</th><th>Plazo</th><th>n</th><th>Acierto</th><th>Vencen</th><th>R neta</th></tr></thead>
+        <tbody>${d.geometrias.map(g=>`<tr><td>${g.stop}</td><td>${g.objetivo}</td>
+          <td>${g.plazo}</td><td>${g.n}</td><td>${(g.aciertos*100).toFixed(1)}%</td>
+          <td>${(g.vencidos*100).toFixed(0)}%</td>
+          <td class="${g.R_neta>0?"pos":"neg"}"><b>${g.R_neta}</b></td></tr>`).join("")}</tbody>
+        </table></div>
+        <div class="note">Ordenado por R neta, comisiones y deslizamiento incluidos. «Vencen» es
+          el porcentaje que se cierra por tiempo sin tocar stop ni objetivo, liquidado a mercado.</div>`:""}
+      ${d.diagnostico?`<h3 style="margin:12px 0 6px;font-size:13px">Pruebas de control</h3>
+        <div class="${/bug|CONTRARIA|DESFASE/.test(d.diagnostico.veredicto)?"warnbox":"okbox"}">
+          <b>${d.diagnostico.veredicto}</b></div>
+        <div class="grid2">
+          <div class="cell"><div class="k">Directo</div><div class="v">${d.diagnostico.acierto_directo}%</div></div>
+          <div class="cell"><div class="k">Invertido</div>
+            <div class="v" style="color:${d.diagnostico.acierto_invertido>54?"var(--rose)":"var(--muted)"}">${d.diagnostico.acierto_invertido}%</div></div>
+          <div class="cell"><div class="k">Señal retrasada</div>
+            <div class="v">${d.diagnostico.acierto_con_senal_retrasada===null?"—":d.diagnostico.acierto_con_senal_retrasada+"%"}</div></div>
+          <div class="cell"><div class="k">Comprar y esperar</div>
+            <div class="v">${d.diagnostico.acierto_de_comprar_siempre}%</div></div>
+        </div>
+        <div class="note"><b>Acierto por horizonte:</b> ${d.diagnostico.curva_por_horizonte.join(" · ")}</div>`:""}
       <div class="warnbox"><b>Lo que este número NO cubre:</b><br>${d.limitaciones.map(l=>"· "+l).join("<br>")}</div>`;}
   else if(d&&d.error)h+=`<div class="warnbox">${d.error}</div>`;
   if(x&&!x.error){
@@ -9998,7 +10211,8 @@ $("bfRun").onclick=async()=>{
   if(S.bf&&!S.bf.error)
     addLog(`<b>Backfill</b> · ${S.bf.sym} ${S.bf.tf}: ${S.bf.n} resoluciones, `+
       `acierto ${(S.bf.acierto*100).toFixed(1)}%, R neta ${S.bf.planes.expectativa_R_neta}`+
-      ` (bruta ${S.bf.planes.expectativa_R_bruta}).`);};
+      ` (bruta ${S.bf.planes.expectativa_R_bruta}).`+
+      (S.bf.diagnostico?`<br><b>Control:</b> ${S.bf.diagnostico.veredicto}`:""));};
 
 /* El botón estaba deshabilitado hasta que hubiera backfill, así que al pulsarlo
    antes no pasaba nada y parecía roto. Ahora siempre responde y dice por qué. */
