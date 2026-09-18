@@ -4119,8 +4119,20 @@ async function validacionCruzada(tf,pares,velas,progreso){
   const nTot=out.reduce((a,x)=>a+x.n,0);
   const aciertoPond=out.reduce((a,x)=>a+x.acierto*x.n,0)/nTot;
   const brierPond=out.reduce((a,x)=>a+x.brier*x.n,0)/nTot;
-  const rPond=out.reduce((a,x)=>a+x.planes.expectativa_R_neta*x.planes.n,0)/
-              out.reduce((a,x)=>a+x.planes.n,0);
+  /* BUG · MATICUSDT devolvió −249 R y arrastró la media ponderada a −13,07,
+     un número imposible. Un par con ATR degenerado o datos rotos produce R
+     absurdas; una sola fila así invalida el agregado de veinte. Se excluyen los
+     valores fuera de un rango plausible y se reporta también la mediana, que no
+     se deja mover por un caso extremo. */
+  const PLAUSIBLE=3;
+  const sanos=out.filter(x=>Math.abs(x.planes.expectativa_R_neta)<=PLAUSIBLE);
+  const excluidos=out.filter(x=>Math.abs(x.planes.expectativa_R_neta)>PLAUSIBLE)
+    .map(x=>`${x.sym} (${x.planes.expectativa_R_neta} R)`);
+  const base=sanos.length?sanos:out;
+  const rPond=base.reduce((a,x)=>a+x.planes.expectativa_R_neta*x.planes.n,0)/
+              base.reduce((a,x)=>a+x.planes.n,0);
+  const rs=base.map(x=>x.planes.expectativa_R_neta).sort((a,b)=>a-b);
+  const rMediana=rs.length?rs[Math.floor(rs.length/2)]:null;
   const positivos=out.filter(x=>x.acierto>0.5).length;
   /* consistencia: qué fracción de pares supera el azar. Un motor que solo
      funciona en uno de veinte no generaliza, por bueno que sea ese uno. */
@@ -4129,6 +4141,8 @@ async function validacionCruzada(tf,pares,velas,progreso){
     acierto_ponderado:+aciertoPond.toFixed(4),
     brier_ponderado:+brierPond.toFixed(4),
     expectativa_R_neta_ponderada:+rPond.toFixed(4),
+    expectativa_R_neta_mediana:rMediana===null?null:+rMediana.toFixed(4),
+    pares_excluidos_por_valor_absurdo:excluidos,
     pares_por_encima_del_azar:positivos, consistencia:+consistencia.toFixed(3),
     veredicto: consistencia>=0.7&&aciertoPond>0.52
       ? "generaliza: el acierto se sostiene fuera de WLD"
@@ -8448,7 +8462,17 @@ const idModelo=m=>typeof m==="string"?m:(m&&(m.id||m.name))||"";
    peldaños para nada. Se excluyen del relevo, y el orden lo fija esta lista:
    primero Flash Lite, que casi siempre tiene hueco, y detrás la familia 2.5,
    que es la más estable. */
-const EXCLUIR_RELEVO=/gemma|embedding|aqa|imagen|veo|tts|native-audio|image-generation/i;
+/* BUG · la escalera se llenaba de modelos que NO son de chat. En la bitácora
+   de Diego aparecían deep-research-pro-preview, antigravity-preview,
+   gemini-robotics-er, nano-banana-pro, gemini-3-pro-image, transcribe,
+   computer-use… Todos devolvían "peticion" o "no_existe", y cada uno gastaba un
+   intento del presupuesto: "12 modelos no caben en 75s". El relevo debe
+   contener SOLO modelos de texto conversacional. */
+const EXCLUIR_RELEVO=new RegExp([
+  "gemma","embedding","aqa","imagen","veo","tts","native-audio","image-generation",
+  "deep-research","antigravity","robotics","nano-banana","transcribe","computer-use",
+  "-image","image-","audio","live","thinking-exp","learnlm","translate","guard","omni"
+].join("|"),"i");
 /* BUG CORREGIDO · el relevo elegía el modelo más antiguo.
    La lista tenía un patrón genérico de flash-lite ANTES que los específicos por
    versión, así que 3.1-flash-lite y 3.5-flash-lite empataban en rango y el
@@ -9047,6 +9071,12 @@ REGLAS:
    SIEMPRE como |objetivo - entrada| / |entrada - stop|.
 7. No prometes resultados ni das seguridades. Hablas de probabilidades y de que invalida cada tesis.
 8. Si el marcador muestra que sobreestimas probabilidades, tenlo en cuenta al dar porcentajes.
+9bis. El campo \`recorrido_reciente\` manda sobre cualquier indicador cuando se trata de describir
+   qué está haciendo el precio. Un sesgo que contradiga la estructura del recorrido hay que
+   justificarlo por escrito en la misma frase, o no se emite. En la autocrítica, compara tu tesis
+   anterior contra el RECORRIDO —velas, rachas, mínimos crecientes—, nunca solo contra el precio
+   de cierre: si diste sesgo bajista y el precio hizo seis velas alcistas seguidas, fallaste
+   aunque el cierre final quede parecido.
 9. ANTES de decir "eso no lo tengo", recorre el JSON entero. Muchas preguntas tienen su respuesta
    en un campo con otro nombre: cacería de liquidez, barrido de stops, squeeze y stop hunt están en
    \`caza_de_liquidez\`; distribución y manipulación en \`trampa_de_liquidez\`; noticias, datos de
@@ -9156,6 +9186,19 @@ async function groqChat(sys,turnos,pregunta,modelo,ms=60000){
 /* Una sola vía para llamar a Groq, use el chat quien la use. Antes el código
    vivía incrustado en gemAsk y por eso Groq solo podía ser el último escalón:
    no había forma de invocarlo primero. */
+/* Deja lo esencial de una rama del contexto: los escalares y las dos primeras
+   entradas de cada lista. Suficiente para responder, una fracción del tamaño. */
+function resumirRama(o){
+  if(Array.isArray(o))return o.slice(0,2);
+  if(!o||typeof o!=="object")return o;
+  const out={};
+  for(const k in o){
+    const v=o[k];
+    if(Array.isArray(v))out[k]=v.slice(0,2);
+    else if(v&&typeof v==="object")out[k]=undefined;
+    else out[k]=v;}
+  return out;}
+
 async function intentarGroq(q,estado){
   if(!$("groqKey")||!$("groqKey").value.trim())
     return{ok:false,err:"groq: sin clave configurada"};
@@ -9164,11 +9207,25 @@ async function intentarGroq(q,estado){
     const gm=($("groqModel")&&$("groqModel").value)||groqState.models[0];
     if(!gm)return{ok:false,err:"groq: ningún modelo disponible"};
     chatEstado(`${estado} · ${gm}…`);
-    const turnos=[{role:"user",content:"Estado actual del mercado (usa SOLO estas cifras):\n"+
-        JSON.stringify(contextoChat())},
+    /* BUG · Groq rechazaba la consulta entera: "Limit 8000, Requested 8939
+       tokens per minute". El contexto completo que traga Gemini no cabe en el
+       nivel gratuito de Groq. En vez de fallar, se recorta: se manda el mismo
+       JSON podado de las ramas más pesadas y menos usadas en el chat, y se
+       limita el historial a dos turnos. */
+    const ctxCompleto=contextoChat();
+    const ctxGroq=JSON.parse(JSON.stringify(ctxCompleto));
+    for(const rama of ["mapa_de_liquidaciones","macro","microestructura","pares",
+                       "rejilla","calibracion","niveles_tecnicos"]){
+      if(ctxGroq[rama]&&typeof ctxGroq[rama]==="object")
+        ctxGroq[rama]=resumirRama(ctxGroq[rama]);}
+    let payload=JSON.stringify(ctxGroq);
+    /* ~4 caracteres por token: dejar margen bajo el límite de 8000 TPM */
+    const MAX_CHARS=18000;
+    if(payload.length>MAX_CHARS)payload=payload.slice(0,MAX_CHARS)+'…"RECORTADO"}';
+    const turnos=[{role:"user",content:"Estado actual del mercado (usa SOLO estas cifras):\n"+payload},
       {role:"assistant",content:"Recibido. Dime qué quieres saber."},
-      ...S.chat.slice(0,-1).slice(-6).map(m=>({
-        role:m.rol==="tu"?"user":"assistant",content:m.txt}))];
+      ...S.chat.slice(0,-1).slice(-2).map(m=>({
+        role:m.rol==="tu"?"user":"assistant",content:String(m.txt).slice(0,1200)}))];
     const txt=await groqChat(CHAT_SYS,turnos,q,gm);
     const cal=calidadRespuesta(txt,q);
     return cal.ok?{ok:true,txt,modelo:"groq:"+gm,cal}
@@ -9211,6 +9268,45 @@ function contextoChat(){
       resumen:S.macroEv.resumen,
       eventos:(S.macroEv.eventos||[]).slice(0,5).map(e=>`${e.titulo} (${e.categoria}, ${e.fecha})`)}
       :null,
+    recorrido_reciente:(()=>{
+      /* BUG DE FONDO · el analista razonaba sobre el precio de AHORA y sobre
+         indicadores, pero nunca veía el CAMINO. Por eso escribía "neutral con
+         sesgo bajista" mientras el activo subía un 17% en 24 horas con mínimos
+         crecientes: tenía el dato del precio, no el de la trayectoria.
+         Esto le entrega la forma del movimiento, no solo su último punto. */
+      const k=S.kl[S.tf];
+      if(!k||k.length<30)return null;
+      const ult=k.slice(-12);
+      const cuerpos=ult.map(c=>c.c>=c.o?1:-1);
+      let racha=1;
+      for(let i=cuerpos.length-1;i>0&&cuerpos[i]===cuerpos[i-1];i--)racha++;
+      const alcistas=cuerpos.filter(x=>x>0).length;
+      const minCrecientes=(()=>{let n=0;
+        for(let i=1;i<ult.length;i++)if(ult[i].l>ult[i-1].l)n++; return n;})();
+      const maxCrecientes=(()=>{let n=0;
+        for(let i=1;i<ult.length;i++)if(ult[i].h>ult[i-1].h)n++; return n;})();
+      const pct=(a,b)=>+(((b-a)/a)*100).toFixed(2);
+      const max3d=Math.max(...k.slice(-Math.min(k.length,Math.round(259200000/TFMS[S.tf]))).map(c=>c.h));
+      const min3d=Math.min(...k.slice(-Math.min(k.length,Math.round(259200000/TFMS[S.tf]))).map(c=>c.l));
+      return{
+        marco:S.tf,
+        ultimas_12_velas:ult.map(c=>({t:fechaHora(c.t),o:c.o,h:c.h,l:c.l,c:c.c,
+          pct:pct(c.o,c.c)})),
+        variacion_12_velas_pct:pct(ult[0].o,ult.at(-1).c),
+        velas_alcistas_de_12:alcistas,
+        racha_actual:`${racha} velas ${cuerpos.at(-1)>0?"alcistas":"bajistas"} seguidas`,
+        minimos_crecientes_de_11:minCrecientes,
+        maximos_crecientes_de_11:maxCrecientes,
+        distancia_al_maximo_de_3_dias_pct:pct(S.last,max3d),
+        distancia_al_minimo_de_3_dias_pct:pct(S.last,min3d),
+        estructura: minCrecientes>=7&&alcistas>=7 ? "impulso alcista con mínimos crecientes"
+          : maxCrecientes<=3&&alcistas<=4 ? "impulso bajista con máximos decrecientes"
+          : "sin estructura direccional clara en las últimas 12 velas",
+        nota:"OBLIGATORIO leer esto antes de emitir un sesgo. Un sesgo bajista con siete de doce "+
+          "velas alcistas, minimos crecientes y el precio rozando el maximo de tres dias es una "+
+          "contradiccion: si aun asi sostienes el sesgo, tienes que decir explicitamente por que "+
+          "el recorrido no te convence. Y en la autocritica, comparar tu tesis anterior contra "+
+          "ESTE recorrido, no solo contra el precio de cierre."};})(),
     caza_de_liquidez:S.caza&&S.caza.tipo?{
       patron:S.caza.tipo,
       sesgo_que_deja:S.caza.dir===1?"alcista":S.caza.dir===-1?"bajista":"neutro",
@@ -10135,8 +10231,13 @@ function renderBf(){
     h+=`<h3 style="margin:14px 0 6px;font-size:13px">Validación cruzada · ${x.pares} pares</h3>
       <div class="${x.consistencia>=0.7?"okbox":"warnbox"}"><b>${x.veredicto}</b><br>
         ${x.muestra_total} resoluciones. Acierto ponderado ${(x.acierto_ponderado*100).toFixed(1)}%,
-        R neta ${x.expectativa_R_neta_ponderada}, ${x.pares_por_encima_del_azar} de ${x.pares}
-        pares por encima del azar.</div>
+        R neta ${x.expectativa_R_neta_ponderada}${x.expectativa_R_neta_mediana!==null
+          ?` (mediana ${x.expectativa_R_neta_mediana})`:""},
+        ${x.pares_por_encima_del_azar} de ${x.pares} pares por encima del azar.
+        ${(x.pares_excluidos_por_valor_absurdo||[]).length
+          ?`<br><b>Excluidos por valor imposible:</b> ${x.pares_excluidos_por_valor_absurdo.join(", ")}.
+            Un par con ATR degenerado o datos rotos arrastra la media; la mediana no se deja mover.`
+          :""}</div>
       <div style="overflow-x:auto"><table class="tbl"><thead><tr><th>Par</th><th>n</th><th>Acierto</th><th>R neta</th></tr></thead>
       <tbody>${x.detalle.map(p=>`<tr><td>${p.par}</td><td>${p.n}</td>
         <td class="${p.acierto>0.5?"pos":"neg"}">${(p.acierto*100).toFixed(1)}%</td>
