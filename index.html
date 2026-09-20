@@ -4456,13 +4456,22 @@ function memoriaAgregada(){
     for(const k in g){
       const e=g[k];
       const fiable=e.n>=CFG.iaCal.minSegmento;
-      out[k]={n:e.n, acierto:+(e.ganadas/e.n).toFixed(3),
+      const acierto=e.ganadas/e.n, prometida=e.sumaP/e.n;
+      /* El sesgo de confianza por segmento es lo accionable: un 41% global no
+         dice dónde inflas. Aquí sí: "en rango prometes 62% y aciertas 28%". */
+      const sesgoConf=prometida-acierto;
+      out[k]={n:e.n, acierto:+acierto.toFixed(3),
         R_media:e.nR?+(e.sumaR/e.nR).toFixed(3):null,
-        probabilidad_que_prometiste:+(e.sumaP/e.n).toFixed(3),
+        probabilidad_que_prometiste:+prometida.toFixed(3),
+        sesgo_de_confianza_aqui:+sesgoConf.toFixed(3),
         fiable,
         lectura:!fiable?`solo ${e.n} casos: no concluyas nada de aquí`
-          :(e.ganadas/e.n)<0.35?"aquí fallas de forma sistemática: exige mucho más antes de operar así"
-          :(e.ganadas/e.n)>0.55?"aquí aciertas: es tu terreno"
+          :acierto<0.35?`aquí fallas de forma sistemática (prometes `+
+            `${Math.round(prometida*100)}% y consigues ${Math.round(acierto*100)}%): `+
+            `exige mucho más antes de operar así y declara una probabilidad más baja`
+          :acierto>0.55?"aquí aciertas: es tu terreno"
+          :sesgoConf>0.15?`resultado del montón, pero inflas ${Math.round(sesgoConf*100)} `+
+            `puntos la probabilidad en este segmento`
           :"resultado del montón"};}
     return{nombre,segmentos:out};};
 
@@ -4473,15 +4482,41 @@ function memoriaAgregada(){
     return /alta|fuerte/.test(x)?"alta":/media|moderad/.test(x)?"media":
            /baja|debil|débil/.test(x)?"baja":null;};
 
+  /* Cruce de dos dimensiones: es donde vive la señal de verdad. Saber que
+     fallas en rango es útil; saber que fallas siendo bajista EN rango es
+     accionable. Solo se ofrece cuando hay muestra para sostenerlo. */
+  const cruce=(nombre,a,b)=>{
+    const g=seg(nombre,h=>{const x=a(h),y=b(h); return (x&&y)?`${x} + ${y}`:null;});
+    const fiables={};
+    for(const k in g.segmentos)if(g.segmentos[k].fiable)fiables[k]=g.segmentos[k];
+    return Object.keys(fiables).length?{nombre,segmentos:fiables}
+      :{nombre,segmentos:{},sin_muestra:"Ningún cruce llega todavía al mínimo de casos."};};
+
+  const conDato=(g,campo)=>{
+    if(Object.keys(g.segmentos).length)return g;
+    return Object.assign(g,{sin_dato:
+      `No hay historial con ${campo} archivado. Los análisis anteriores a la v9.4 no lo `+
+      `guardaban; se irá llenando con cada análisis nuevo. NO es que el dato no exista: `+
+      `es que aún no hay muestra. No lo propongas como mejora.`});};
+
   return{
     analisis_archivados:hs.length,
     entradas_resueltas:resueltos.length,
     desde:hs.length?fechaHora(hs[hs.length-1].t):null,
     por_sesgo:seg("sesgo que diste",h=>norm(h.sesgo)),
     por_conviccion:seg("convicción que declaraste",h=>conv(h.conviccion)),
-    por_regimen:seg("régimen del mercado",h=>h.motor&&h.motor.regimen),
+    por_regimen:conDato(seg("régimen del mercado",h=>h.motor&&h.motor.regimen),"el régimen del HMM"),
     por_trampa:seg("trampa de liquidez activa",h=>h.motor?(h.motor.trampa?"con trampa":"sin trampa"):null),
+    por_trampa_detallada:conDato(seg("trampa por dirección y firmas",h=>{
+      if(!h.motor||!h.motor.trampa)return null;
+      const f=h.motor.trampa_firmas;
+      return Number.isFinite(f)?`${h.motor.trampa} con ${f} firmas`:`${h.motor.trampa}`;}),
+      "el número de firmas de la trampa"),
     por_horizonte:seg("horizonte",h=>h.horizonte||null),
+    cruce_regimen_sesgo:cruce("régimen × sesgo",
+      h=>h.motor&&h.motor.regimen,h=>norm(h.sesgo)),
+    cruce_conviccion_regimen:cruce("convicción × régimen",
+      h=>conv(h.conviccion),h=>h.motor&&h.motor.regimen),
     como_usarlo:"Esto resume TODOS tus análisis archivados, no los tres últimos. Antes de fijar "+
       "un sesgo, mira el segmento que te toca: si en ese régimen o con esa convicción tu acierto "+
       "historico esta por debajo de 0,35, estas repitiendo un error conocido y debes decirlo "+
@@ -4694,7 +4729,16 @@ function archivarAnalisis(d,model){
       trampa:S.trap&&S.trap.activa?(S.trap.dir===1?"alcista":"bajista"):null,
       /* Contexto del momento: sin esto no se puede segmentar el desempeño y la
          retroalimentación se queda en un promedio global que no enseña nada. */
-      regimen:S.hmm&&S.hmm.estado?S.hmm.estado:null,
+      /* BUG CORREGIDO · el campo del HMM se llama `regimen`, no `estado`, así
+         que esto guardaba null siempre y el desglose por régimen salía vacío.
+         Lo detectó la propia IA leyendo su payload: "el bloque
+         lo_que_llevas_aprendido no desglosa mi acierto por régimen de mercado".
+         Tenía razón. */
+      regimen:S.hmm&&S.hmm.regimen?S.hmm.regimen:null,
+      regimen_prob:S.hmm&&Number.isFinite(S.hmm.prob)?+S.hmm.prob.toFixed(3):null,
+      /* Granularidad de la trampa, que también pidió: no es lo mismo una trampa
+         con 3 firmas que con 5, ni una alcista que una bajista. */
+      trampa_firmas:S.trap&&S.trap.activa?S.trap.n:null,
       adx:Number.isFinite(S.adx)?+S.adx.toFixed(1):null,
       vpin:S.vpinNivel===null||S.vpinNivel===undefined?null:+S.vpinNivel.toFixed(3),
       caza:S.caza&&S.caza.activa?(S.caza.dir===1?"alcista":"bajista"):null,
@@ -8577,7 +8621,11 @@ AUTOCALIBRACION · ESTO NO ES DECORATIVO
   propias entradas resueltas. Lee su campo instruccion y obedecelo. Declara la probabilidad que
   de verdad creas: inflarla no te beneficia porque la correccion se aplica encima.
 · lo_que_llevas_aprendido resume TODOS tus analisis archivados partidos por sesgo, conviccion,
-  regimen, trampa y horizonte. ANTES de fijar el sesgo, busca el segmento que te toca hoy:
+  regimen, trampa —con su direccion y su numero de firmas— y horizonte, mas los cruces
+  regimen×sesgo y conviccion×regimen, y el sesgo_de_confianza_aqui de cada segmento.
+· Si un bloque trae sin_dato, significa que el campo existe pero aun no hay historial con el.
+  NO lo propongas como mejora de medicion: ya esta implementado y se ira llenando solo.
+  Antes de proponer cualquier mejora de medicion, comprueba que el dato no este ya en el JSON. ANTES de fijar el sesgo, busca el segmento que te toca hoy:
   - si tu acierto historico en ese segmento esta por debajo de 0,35, estas a punto de repetir un
     error conocido: dilo explicitamente en la tesis y baja la probabilidad que declares;
   - si esta por encima de 0,55, es tu terreno y puedes sostener la conviccion;
