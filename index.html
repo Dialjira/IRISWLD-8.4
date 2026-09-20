@@ -2759,7 +2759,8 @@ async function radarMacroIA(forzar){
     }catch(e){
       const tipo=clasificarError(e);
       errores.push(`${modelo}: ${tipo}`);
-      if(tipo==="capacidad"||tipo==="cuota"){guardarPerfil(modelo,{saturadoHasta:Date.now()+180000});continue;}
+      if(tipo==="capacidad"||tipo==="cuota"){
+        guardarPerfil(modelo,{saturadoHasta:Date.now()+(esperaDeError(e)||180000)});continue;}
       if(tipo==="permiso"||tipo==="red")break;
       /* algunos modelos no admiten la herramienta de búsqueda */
       continue;}}
@@ -7379,19 +7380,40 @@ function gemUrl(model,method){
 /* Reintento con espera creciente para errores transitorios. Un 500 o un 503 de
    Google se resuelve solo la mayoría de las veces; antes abortaba a la primera
    porque el catch de arriba solo contemplaba 404 y 400. */
+/* BUG CORREGIDO · los 429 se multiplicaban solos.
+   Un 429 se trataba como fallo transitorio y se reintentaba tres veces con
+   esperas de 1,5 / 4 / 9 segundos. Pero un 429 de Google NO es un tropiezo de
+   red: es la cuota agotada, y en el nivel gratuito se mide por peticiones y por
+   tokens POR MINUTO. Reintentar a los 1,5 segundos con el mismo payload de 80
+   KB no la recupera: la consume más. Cada reintento contaba como petición nueva
+   y alargaba el bloqueo, así que la app fabricaba sus propios 429 en cascada.
+   Ahora: los 5xx se reintentan, que son los que sí se arreglan solos; un 429 se
+   abandona de inmediato y se pasa al siguiente modelo, que es lo único que
+   puede funcionar cuando la cuota de uno está agotada. */
 async function gemCall(body,model,timeoutMs=120000,intentos=3){
   let ultimo=null;
   for(let i=0;i<intentos;i++){
     try{ return await gemCallUna(body,model,timeoutMs); }
     catch(e){
       ultimo=e;
-      const transitorio=e.code===429||e.code===500||e.code===502||e.code===503||e.code===504;
+      if(e.code===429)throw e;                 // cuota: no insistir, cambiar de modelo
+      const transitorio=e.code===500||e.code===502||e.code===503||e.code===504;
       if(!transitorio||i===intentos-1)throw e;
       const espera=[1500,4000,9000][i];
       if(typeof gemBusy==="function"&&gemState.busy)
         gemBusy(true,`${e.code} de Google · reintento ${i+2} de ${intentos} en ${espera/1000}s`);
       await new Promise(r=>setTimeout(r,espera));}}
   throw ultimo;}
+
+/* Google dice en el cuerpo del 429 cuánto hay que esperar, en un campo
+   retryDelay tipo "37s". Se estaba tirando ese dato y marcando 10 minutos
+   fijos para todos, así que un bloqueo de 20 segundos apartaba un modelo
+   bueno durante diez minutos. */
+function esperaDeError(e){
+  const m=String(e&&e.message||"").match(/retryDelay[^0-9]{0,12}(\d+(?:\.\d+)?)\s*s/i);
+  if(m){const seg=parseFloat(m[1]);
+    if(Number.isFinite(seg)&&seg>0)return Math.min(600,Math.max(5,seg))*1000;}
+  return null;}
 
 async function gemCallUna(body,model,timeoutMs=120000){
   const ctrl=new AbortController();
@@ -8237,6 +8259,39 @@ function podar(o){
     return Object.keys(r).length?r:undefined;}
   return o===null?undefined:o;}
 
+/* ══════════════════════════════════════════════════════════════════════
+   AJUSTE DE TAMAÑO DEL PAYLOAD · la causa raíz de los 429
+   La escalera de peldaños iba de más pesado a menos pesado y la instantánea
+   compactada era el CUARTO peldaño. O sea que antes de intentar reducir nada
+   se mandaban tres peticiones con el snapshot entero —80,7 KB, unos 20.000
+   tokens cada una— y eso por cada modelo de la escalera. El nivel gratuito de
+   Google mide cuota por peticiones y por tokens POR MINUTO: un solo "Analizar"
+   podía gastar la cuota de varios minutos y devolver 429 en cascada, que a su
+   vez marcaba saturados a todos los modelos.
+   Reducir el payload no es una degradación de emergencia, es higiene: se hace
+   ANTES de la primera llamada, no después de fallar tres veces.
+   ══════════════════════════════════════════════════════════════════════ */
+function ajustarSnapshot(snap,maxKB){
+  const bytes=t=>JSON.stringify(t).length;
+  const tope=maxKB*1024;
+  if(bytes(snap)<=tope)return{snap,recortes:[],kb:+(bytes(snap)/1024).toFixed(1)};
+  const recortes=[];
+  let c=compactarSnapshot(snap);
+  recortes.push("notas e historial");
+  if(bytes(c)<=tope)return{snap:c,recortes,kb:+(bytes(c)/1024).toFixed(1)};
+  /* Recorte progresivo de las listas más largas: se queda con la cabeza de
+     cada una, que es la parte que de verdad se lee. Nunca toca escalares. */
+  for(const limite of [12,8,5,3,2]){
+    c=(function corta(o){
+      if(Array.isArray(o))return o.slice(0,limite).map(corta);
+      if(o&&typeof o==="object"){const r={};
+        for(const k in o)r[k]=corta(o[k]); return r;}
+      return o;})(c);
+    if(bytes(c)<=tope){recortes.push(`listas a ${limite} elementos`);
+      return{snap:c,recortes,kb:+(bytes(c)/1024).toFixed(1)};}}
+  recortes.push("listas a 2 elementos");
+  return{snap:c,recortes,kb:+(bytes(c)/1024).toFixed(1)};}
+
 function compactarSnapshot(snap){
   const c=JSON.parse(JSON.stringify(snap));
   const limpiarNotas=o=>{
@@ -8493,30 +8548,65 @@ const FAMILIAS=[
   {re:/flash.*lite|lite.*flash/i, n:"flash-lite", orden:2},
   {re:/flash/i,                   n:"flash",      orden:0},
   {re:/pro/i,                     n:"pro",        orden:1}];
+/* BUG CORREGIDO · la tabla decía flash-lite y la app usaba otro modelo.
+   rangoModelo mezclaba DOS ESCALAS que no son comparables entre sí:
+     · modelo CON historial → 10 − puntuacion/10, o sea 0..10
+     · modelo SIN historial → orden de familia, o sea 0, 1 o 2
+   Y el sort es ascendente. Con la tabla de Diego, gemini-3.5-flash-lite medido
+   con 82 puntos daba rango 1,8, mientras que un gemini-3.8-flash SIN UNA SOLA
+   medición daba rango 0 por ser de la familia flash. El no medido ganaba
+   siempre. Lo medido perdía contra lo desconocido, que es exactamente lo
+   contrario de para qué se midió.
+   Ahora todo vive en la misma escala 0..10, y la franja 4..5 es el territorio
+   de lo no medido: un modelo con más de 60 puntos medidos entra por delante de
+   cualquier desconocido, y uno por debajo de 50 se queda detrás. Lo probado
+   manda, y lo desconocido solo se prueba cuando lo probado es malo. */
 function rangoModelo(m){
-  /* Con historial suficiente, el rango sale de lo medido y no de la familia:
-     10 menos la puntuación normalizada, para que el mejor medido quede primero
-     y el sort ascendente siga funcionando igual. */
   const f=fiabilidadModelo(m);
-  if(f)return 10-(f.puntuacion/10);
-  for(let i=0;i<FAMILIAS.length;i++)if(FAMILIAS[i].re.test(m))return FAMILIAS[i].orden;
-  return FAMILIAS.length;}
+  if(f)return clamp(10-(f.puntuacion/10),0,10);
+  let orden=FAMILIAS.length;
+  for(let i=0;i<FAMILIAS.length;i++)if(FAMILIAS[i].re.test(m)){orden=FAMILIAS[i].orden;break;}
+  /* 4,0 · 4,5 · 5,0 · 5,5 — el centro incierto de la escala */
+  return 4+orden*0.5;}
 function versionModelo(m){
   const x=String(m).match(/gemini-(\d+(?:\.\d+)?)/i);
   return x?parseFloat(x[1]):0;}
 
+/* BUG CORREGIDO · el modelo elegido desaparecía sin dejar rastro.
+   El filtro `libres` eliminaba de la lista a cualquiera marcado saturado, y el
+   elegido es el primero en saturarse porque es el primero que se usa. Un solo
+   429 lo borraba diez minutos y la app pasaba a otro modelo sin que en la
+   pantalla del informe se dijera nada.
+   Y el remate: `libres.length ? libres : todos` — cuando TODOS estaban
+   saturados devolvía la lista entera y volvía a machacar a Google, que
+   respondía 429 otra vez y alargaba la saturación. Un bucle que se alimentaba
+   solo, igual que el del WebSocket.
+   Ahora el elegido nunca se borra: si está saturado baja al final de la cola en
+   vez de desaparecer, y si no queda ni uno libre se devuelve lista vacía para
+   que quien llame lo diga y espere, en lugar de insistir. */
 function modelosDisponibles(actual){
   const now=Date.now();
   const elegido=idModelo(actual);
   const ids=gemState.models.map(idModelo).filter(Boolean);
-  /* el elegido siempre primero aunque esté excluido: es decisión del usuario */
   const relevo=ids.filter(m=>m!==elegido&&!EXCLUIR_RELEVO.test(m))
     .sort((a,b)=>rangoModelo(a)-rangoModelo(b)
       ||versionModelo(b)-versionModelo(a)      // versión más alta primero
       ||a.localeCompare(b));
   const todos=[elegido,...relevo].filter((m,i,a)=>m&&a.indexOf(m)===i);
   const libres=todos.filter(m=>perfilModelo(m).saturadoHasta<now);
-  return libres.length?libres:todos;}
+  /* el elegido, aunque esté saturado, se conserva al final: es decisión suya y
+     su cuota puede haberse liberado antes de lo estimado */
+  if(libres.length&&elegido&&!libres.includes(elegido))libres.push(elegido);
+  return libres;}
+
+/* Cuánto falta para que se libere el primero, en segundos. */
+function esperaCuota(actual){
+  const now=Date.now();
+  const elegido=idModelo(actual);
+  const ids=[elegido,...gemState.models.map(idModelo)].filter(Boolean);
+  const t=ids.map(m=>perfilModelo(m).saturadoHasta||0).filter(x=>x>now);
+  if(!t.length)return 0;
+  return Math.ceil((Math.min(...t)-now)/1000);}
 
 async function gemAnalyze(){
   const key=$("gemKey").value.trim();
@@ -8531,10 +8621,22 @@ async function gemAnalyze(){
     catch(e){ gemBusy(false,`<span style="color:var(--rose)">${e.message}</span>`); return; }}
   const elegido=$("gemModel").value;
   const think=parseInt($("gemThink").value)||0;
-  gemState.snap=podar(buildSnapshot())||{};
-  const snapCompacto=compactarSnapshot(gemState.snap);
+  const snapCrudo=podar(buildSnapshot())||{};
   const kb=t=>(JSON.stringify(t).length/1024).toFixed(1);
+  gemState.snapCrudoKB=kb(snapCrudo);
+  /* 34 KB ≈ 8.500 tokens de entrada. Con el snapshot entero eran 20.000 por
+     llamada y la cuota del nivel gratuito no aguanta esa cadencia. */
+  const ajuste=ajustarSnapshot(snapCrudo,34);
+  gemState.snap=ajuste.snap;
+  gemState.recortes=ajuste.recortes;
+  const snapCompacto=compactarSnapshot(gemState.snap);
   gemState.snapKB=kb(gemState.snap);
+  if(ajuste.recortes.length)
+    addLog(`<b>Instantánea ajustada</b> · ${gemState.snapCrudoKB} KB → ${gemState.snapKB} KB `+
+      `(${ajuste.recortes.join(", ")}). Cada llamada pesaba unos `+
+      `${Math.round(gemState.snapCrudoKB*256)} tokens y ahora pesa `+
+      `${Math.round(gemState.snapKB*256)}: es la diferencia entre agotar la cuota de Google `+
+      `en un análisis o no agotarla.`);
   gemState.history=[];
 
   const INSTRUCCION_JSON=
@@ -8578,8 +8680,18 @@ async function gemAnalyze(){
     {n:"sin esquema estructurado", b:m=>armar(m,null,gemState.snap,INSTRUCCION_JSON)},
     {n:"instantánea compactada",   b:m=>armar(m,null,snapCompacto,INSTRUCCION_JSON)}];
 
-  gemBusy(true,`Consultando ${elegido} · ${gemState.snapKB} KB`);
+  gemBusy(true,`Consultando ${elegido} · ${gemState.snapKB} KB`+
+    (gemState.recortes&&gemState.recortes.length?` (ajustada desde ${gemState.snapCrudoKB} KB)`:""));
   const modelos=modelosDisponibles(elegido);
+  /* Sin un solo modelo libre no hay nada que intentar: insistir solo alarga el
+     bloqueo de Google. Se dice cuánto falta y se para. */
+  if(!modelos.length){
+    const seg=esperaCuota(elegido);
+    gemBusy(false,`<span style="color:var(--rose)">Cuota de Google agotada en todos tus modelos. `+
+      `Se libera en unos ${seg} s. Insistir ahora la alarga: espera ese tiempo, o usa `+
+      `«Informe esencial» que pesa la mitad.</span>`);
+    addLog(`<b>Análisis detenido:</b> sin modelos libres, ${seg} s para el primero.`);
+    return;}
   const descartados=gemState.models.map(idModelo).filter(m=>EXCLUIR_RELEVO.test(m));
   const saltados=[elegido,...gemState.models.map(idModelo)]
     .filter((m,i,a)=>m&&a.indexOf(m)===i&&!modelos.includes(m));
@@ -8614,7 +8726,8 @@ async function gemAnalyze(){
           i++; continue;}
         if(tipo==="capacidad"||tipo==="cuota"){
           /* el modelo no da abasto: degradar la petición no arregla nada */
-          guardarPerfil(modelo,{saturadoHasta:Date.now()+(tipo==="cuota"?600000:180000),
+          guardarPerfil(modelo,{saturadoHasta:Date.now()+
+            (esperaDeError(e)||(tipo==="cuota"?600000:180000)),
             fallos:perfil.fallos+1});
           i=PELDANOS.length; break;}
         if(tipo==="no_existe"){
@@ -8976,7 +9089,7 @@ async function gemAudit(){
       if(tipo==="capacidad"||tipo==="cuota"){
         /* mismo criterio que el analista: ante saturación se cambia de modelo,
            no se recorta la petición */
-        guardarPerfil(model,{saturadoHasta:Date.now()+180000});
+        guardarPerfil(model,{saturadoHasta:Date.now()+(esperaDeError(e)||180000)});
         const otros=modelosDisponibles(model).filter(m=>m!==idModelo(model));
         if(otros.length){model=otros[0];
           box.innerHTML=`<div class="note">${model} tomado del relevo (el anterior está saturado)…</div>`;
@@ -9426,6 +9539,19 @@ async function gemAsk(){
   S.chatCancelado=false;
   const proveedor=($("iaProveedor")&&$("iaProveedor").value)||"gemini";
   const elegido=$("gemModel").value;
+  /* Cuota agotada en todos: decirlo y esperar. Insistir la alarga. */
+  if(proveedor==="gemini"){
+    const libres=modelosDisponibles(elegido);
+    if(!libres.length){
+      const seg=esperaCuota(elegido);
+      const hayGroq=$("groqKey")&&$("groqKey").value.trim();
+      if(!hayGroq){
+        clearTimeout(S.chatVigia);
+        if($("gemCancel"))$("gemCancel").style.display="none";
+        gemState.busy=false; $("gemAskBtn").disabled=false;
+        chatEstado(`Cuota de Google agotada en todos tus modelos. Se libera en unos ${seg} s. `+
+          `Configura una clave de Groq en la sección 03 para no depender de esto.`,"var(--rose)");
+        return;}}}
   /* Con Groq como principal, Gemini ni se consulta salvo que Groq falle. */
   const modelos=proveedor==="groq_solo"?[]:modelosDisponibles(elegido);
   /* Si tu modelo queda fuera por saturación, decirlo: antes desaparecía sin
@@ -9487,7 +9613,9 @@ async function gemAsk(){
       anotarModelo(modelo,(tipo==="cuota"||tipo==="capacidad")?"cuota":"err");
       errores.push(`${modelo}: ${tipo}`);
       if(tipo==="capacidad"||tipo==="cuota"){
-        guardarPerfil(modelo,{saturadoHasta:Date.now()+(tipo==="cuota"?600000:180000)});
+        const dicho=esperaDeError(e);
+        guardarPerfil(modelo,{saturadoHasta:Date.now()+
+          (dicho||(tipo==="cuota"?600000:180000))});
         continue;}
       if(tipo==="permiso"||tipo==="red"){chatEstado(e.message,"var(--rose)");break;}
       continue;}}
