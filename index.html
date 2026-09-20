@@ -930,6 +930,11 @@ const CFG={
         semivida:{corto:60, medio:264}},
   /* Banco de pruebas: ventana y paso del recorrido hacia delante */
   lab:{barras:200, paso:1, minMuestra:60},
+  /* Autocalibración de la IA: mismas cautelas que el resto del motor.
+     minN     · entradas resueltas para empezar a corregir
+     plenoN   · a partir de cuántas se aplica la corrección entera
+     minSegmento · muestra para que un segmento sea fiable */
+  iaCal:{minN:20, plenoN:60, minSegmento:8},
   /* COSTES REALES · un sistema de 0,35R bruto puede ser 0,05R neto. Sin esto,
      "funciona" es una hipótesis sin comprobar. Valores por defecto de Binance
      USDⓈ-M con taker en ambas patas; el fondeo se descuenta por hora de vida
@@ -4349,6 +4354,139 @@ function evaluarMejoras(){
     return{...m, nombreMetrica:M?M.n:null, valor1:v1, delta, veredicto, deriva, causal,
       horas:(Date.now()-m.t)/3600000};});}
 
+/* ══════════════════════════════════════════════════════════════════════
+   AUTOCALIBRACIÓN DE LA IA
+   El motor ya se autocalibraba: planCal corrige la confianza declarada de cada
+   plan contra su acierto real, y Platt ajusta la z. La IA no tenía nada
+   equivalente. Su marcador se calculaba, se mostraba y se le mandaba como un
+   aviso de texto —"prometes 57,6% y consigues 41,6%"— confiando en que hiciera
+   caso. Eso es retroalimentación por lectura, y en este proyecto ya aprendimos
+   que un modelo no infiere de un aviso: hay que darle el número corregido.
+   Aquí se calcula la misma regresión de Platt que usa el motor, pero sobre las
+   probabilidades que declara la IA contra lo que de verdad le pasó a sus
+   entradas. El resultado no se muestra y ya: se le entrega la probabilidad
+   YA CORREGIDA junto a la que declaró, y el factor que las separa.
+   ══════════════════════════════════════════════════════════════════════ */
+function calibrarIA(){
+  const res=(S.gemTrades||[]).filter(q=>
+    Number.isFinite(q.pIA)&&(q.estado==="ganada"||q.estado==="perdida"));
+  const n=res.length;
+  if(n<CFG.iaCal.minN)
+    return{suficiente:false,n,minimo:CFG.iaCal.minN,a:1,b:0,
+      nota:`Hacen falta ${CFG.iaCal.minN} entradas resueltas para calibrar; hay ${n}.`};
+  /* Regresión logística de una variable por Newton sobre el logit declarado:
+     p_real = sigma(a · logit(p_declarada) + b). Dos parámetros, que es lo
+     máximo que sostiene una muestra de decenas. */
+  const X=res.map(q=>Math.log(clamp(q.pIA,0.02,0.98)/(1-clamp(q.pIA,0.02,0.98))));
+  const Y=res.map(q=>q.estado==="ganada"?1:0);
+  let a=1,b=0;
+  for(let it=0;it<60;it++){
+    let g0=0,g1=0,h00=0,h01=0,h11=0;
+    for(let i=0;i<n;i++){
+      const z=a*X[i]+b, p=1/(1+Math.exp(-z)), e=p-Y[i], w=p*(1-p);
+      g0+=e*X[i]; g1+=e;
+      h00+=w*X[i]*X[i]; h01+=w*X[i]; h11+=w;}
+    const lam=1e-4;                              // regularización: evita divergir
+    h00+=lam; h11+=lam;
+    const det=h00*h11-h01*h01;
+    if(!Number.isFinite(det)||Math.abs(det)<1e-12)break;
+    const da=( h11*g0-h01*g1)/det, db=(-h01*g0+h00*g1)/det;
+    a-=da; b-=db;
+    if(Math.abs(da)+Math.abs(db)<1e-8)break;}
+  if(!Number.isFinite(a)||!Number.isFinite(b))return{suficiente:false,n,a:1,b:0};
+  /* Encogimiento por muestra corta: con 25 casos no se aplica la corrección
+     entera, se aplica la parte que la muestra sostiene. */
+  const k=clamp((n-CFG.iaCal.minN)/CFG.iaCal.plenoN,0,1);
+  const aEnc=1+(a-1)*k, bEnc=b*k;
+  const pMedia=res.reduce((s2,q)=>s2+q.pIA,0)/n;
+  const tasa=Y.reduce((s2,y)=>s2+y,0)/n;
+  const brier=res.reduce((s2,q,i)=>s2+(q.pIA-Y[i])**2,0)/n;
+  return{suficiente:true,n,a:+aEnc.toFixed(4),b:+bEnc.toFixed(4),
+    encogimiento:+k.toFixed(2),
+    probabilidad_media_declarada:+pMedia.toFixed(3),
+    acierto_real:+tasa.toFixed(3),
+    brier:+brier.toFixed(4),
+    sesgo_de_confianza:+(pMedia-tasa).toFixed(3)};}
+
+/* Aplica la calibración a una probabilidad declarada.
+   GUARDARRAÍL · la regresión puede salir con pendiente mayor que 1, y entonces
+   estira los extremos: en pruebas, un 0,80 declarado se convertía en 0,817. O
+   sea que un modelo que sobreestima de media acabaría viendo PREMIADA su
+   declaración más agresiva. Matemáticamente es lo que dice el ajuste, pero como
+   política de riesgo es inaceptable: si el sesgo global de confianza es
+   positivo, la corrección solo puede bajar, nunca subir. */
+function pCalibradaIA(p,cal){
+  if(!cal||!cal.suficiente||!Number.isFinite(p))return null;
+  const q=clamp(p,0.02,0.98);
+  const z=cal.a*Math.log(q/(1-q))+cal.b;
+  let out=clamp(1/(1+Math.exp(-z)),0.01,0.99);
+  if(cal.sesgo_de_confianza>0)out=Math.min(out,q);
+  return +out.toFixed(3);}
+
+/* ══ MEMORIA AGREGADA DE TODOS LOS ANÁLISIS ══
+   Al modelo solo le llegaban tres análisis anteriores tras compactar, así que
+   "aprender de lo anterior" era aprender de tres casos. Mandarle los 120 que
+   hay guardados es imposible por tamaño.
+   La salida es esta: no se mandan los análisis, se manda lo que ENSEÑAN. Un
+   resumen estadístico de TODOS, partido por las condiciones que de verdad
+   cambian el resultado —sesgo, régimen, convicción, trampa— y con cada
+   segmento marcado como fiable o no según su muestra. Cabe en un par de KB y
+   contiene el aprendizaje de meses. */
+function memoriaAgregada(){
+  const hs=S.gemHist||[], tr=S.gemTrades||[];
+  if(!hs.length)return null;
+  const resueltos=tr.filter(q=>q.estado==="ganada"||q.estado==="perdida");
+  const porAnalisis={};
+  for(const q of resueltos){
+    (porAnalisis[q.anId]=porAnalisis[q.anId]||[]).push(q);}
+
+  const seg=(nombre,clave)=>{
+    const g={};
+    for(const h of hs){
+      const k=clave(h);
+      if(k===null||k===undefined)continue;
+      const props=porAnalisis[h.id]||[];
+      if(!props.length)continue;
+      const e=g[k]||(g[k]={n:0,ganadas:0,sumaR:0,nR:0,sumaP:0});
+      for(const q of props){
+        e.n++; if(q.estado==="ganada")e.ganadas++;
+        if(Number.isFinite(q.resultadoR)){e.sumaR+=q.resultadoR; e.nR++;}
+        if(Number.isFinite(q.pIA))e.sumaP+=q.pIA;}}
+    const out={};
+    for(const k in g){
+      const e=g[k];
+      const fiable=e.n>=CFG.iaCal.minSegmento;
+      out[k]={n:e.n, acierto:+(e.ganadas/e.n).toFixed(3),
+        R_media:e.nR?+(e.sumaR/e.nR).toFixed(3):null,
+        probabilidad_que_prometiste:+(e.sumaP/e.n).toFixed(3),
+        fiable,
+        lectura:!fiable?`solo ${e.n} casos: no concluyas nada de aquí`
+          :(e.ganadas/e.n)<0.35?"aquí fallas de forma sistemática: exige mucho más antes de operar así"
+          :(e.ganadas/e.n)>0.55?"aquí aciertas: es tu terreno"
+          :"resultado del montón"};}
+    return{nombre,segmentos:out};};
+
+  const norm=t=>{const x=(t||"").toLowerCase();
+    return /alcis|larg/.test(x)?"alcista":/bajis|cort/.test(x)?"bajista":
+           /neutral|rango|lateral/.test(x)?"neutral":null;};
+  const conv=t=>{const x=(t||"").toLowerCase();
+    return /alta|fuerte/.test(x)?"alta":/media|moderad/.test(x)?"media":
+           /baja|debil|débil/.test(x)?"baja":null;};
+
+  return{
+    analisis_archivados:hs.length,
+    entradas_resueltas:resueltos.length,
+    desde:hs.length?fechaHora(hs[hs.length-1].t):null,
+    por_sesgo:seg("sesgo que diste",h=>norm(h.sesgo)),
+    por_conviccion:seg("convicción que declaraste",h=>conv(h.conviccion)),
+    por_regimen:seg("régimen del mercado",h=>h.motor&&h.motor.regimen),
+    por_trampa:seg("trampa de liquidez activa",h=>h.motor?(h.motor.trampa?"con trampa":"sin trampa"):null),
+    por_horizonte:seg("horizonte",h=>h.horizonte||null),
+    como_usarlo:"Esto resume TODOS tus análisis archivados, no los tres últimos. Antes de fijar "+
+      "un sesgo, mira el segmento que te toca: si en ese régimen o con esa convicción tu acierto "+
+      "historico esta por debajo de 0,35, estas repitiendo un error conocido y debes decirlo "+
+      "explicitamente y bajar la probabilidad que declares. Ignora los segmentos con fiable=false."};}
+
 function buildAutoevaluacion(){
   const r=(v,n=2)=>Number.isFinite(v)?+v.toFixed(n):null;
   const px=S.last;
@@ -4364,15 +4502,35 @@ function buildAutoevaluacion(){
       vigencia:horas<12?"vigente":horas<48?"reciente":horas<168?"antiguo":"historico",
       sesgo_que_dio:h.sesgo, conviccion:h.conviccion, tesis:h.tesis,
       precio_entonces:r(h.px,5), precio_ahora:r(px,5),
-      movimiento_desde_entonces_pct:r(mov),
+      /* BUG CORREGIDO · la autocritica medía el punto final y se saltaba el camino.
+         El motor SÍ calculaba la excursión máxima, pero el payload la enterraba en
+         un subobjeto mientras ofrecía arriba tres campos que se leen como "el
+         resultado": precio_entonces, precio_ahora y movimiento_desde_entonces_pct.
+         El modelo escribía con esos tres. Caso real: análisis a 0,4328, el precio
+         tocó 0,4537 (+4,83%) y volvió a 0,4368; la autocrítica informó "+0,92%,
+         acertando la dirección", subestimando el acierto cinco veces.
+         Ahora el máximo y el mínimo alcanzados son campos de primer nivel, y el
+         punto a punto lleva un nombre que dice exactamente lo que mide. */
+      ...(()=>{
+        const R=recorridoDesde(h.t,h.px);
+        if(!R)return{variacion_punto_a_punto_pct:r(mov),
+          maximo_alcanzado_pct:null,minimo_alcanzado_pct:null};
+        const favorable=/bajis|cort/.test((h.sesgo||"").toLowerCase())?R.maxBajada:R.maxSubida;
+        return{
+          maximo_alcanzado_pct:r(R.maxSubida),
+          minimo_alcanzado_pct:r(R.maxBajada),
+          excursion_a_favor_de_tu_sesgo_pct:r(favorable),
+          rango_recorrido_pct:r(R.rango),
+          variacion_punto_a_punto_pct:r(mov),
+          precio_maximo:r(R.max,5), precio_minimo:r(R.min,5),
+          marco_del_recorrido:R.tf, cobertura_parcial:!!R.parcial,
+          como_juzgarlo:"El recorrido manda sobre el punto a punto. Si el precio llego a "+
+            "maximo_alcanzado_pct y luego volvio, tu tesis acerto CON ESA magnitud aunque la "+
+            "variacion punto a punto sea pequena. Y al reves: una excursion en contra grande "+
+            "invalida la tesis aunque el precio haya vuelto, porque un stop razonable habria "+
+            "saltado. PROHIBIDO describir el resultado citando solo variacion_punto_a_punto_pct."};})(),
       acerto_la_direccion:(()=>{const j=evaluarSesgo(h,mov);return j.acerto;})(),
       juicio:evaluarSesgo(h,mov).txt,
-      recorrido_desde_entonces:(()=>{
-        const R=recorridoDesde(h.t,h.px);
-        return R?{maxima_subida_pct:r(R.maxSubida),maxima_bajada_pct:r(R.maxBajada),
-          rango_recorrido_pct:r(R.rango),marco:R.tf,cobertura_parcial:!!R.parcial,
-          nota:"El punto final no basta. Si la excursion en contra fue grande, la tesis no era "+
-            "operable aunque el precio haya vuelto: un stop razonable habria saltado."}:null;})(),
       probabilidad_del_motor_entonces:h.motor.prob,
       trampa_detectada_entonces:h.motor.trampa,
       propuestas:props.slice(0,6).map(q=>({direccion:q.dir===1?"largo":"corto",plazo:q.plazo,
@@ -4422,6 +4580,27 @@ function buildAutoevaluacion(){
       trampa_de_liquidez:{entonces:ult.motor.trampa,
         ahora:S.trap&&S.trap.activa?(S.trap.dir===1?"alcista":"bajista"):null}}:null,
     tus_analisis_anteriores:hs,
+    /* La corrección que el motor aplica a tus probabilidades, ya calculada. */
+    tu_calibracion:(()=>{
+      const c=calibrarIA();
+      if(!c.suficiente)return{calibrada:false,n:c.n,nota:c.nota};
+      const ej=[0.5,0.6,0.7].map(p=>`${p}→${pCalibradaIA(p,c)}`).join("  ");
+      return{calibrada:true, entradas_resueltas:c.n,
+        probabilidad_media_que_declaras:c.probabilidad_media_declarada,
+        acierto_real:c.acierto_real, sesgo_de_confianza:c.sesgo_de_confianza,
+        brier:c.brier, encogimiento_por_muestra:c.encogimiento,
+        equivalencias:ej,
+        instruccion:c.sesgo_de_confianza>0.08
+          ? `Declaras de media ${Math.round(c.probabilidad_media_declarada*100)}% y consigues `+
+            `${Math.round(c.acierto_real*100)}%. La app ya corrige tus probabilidades con esta `+
+            `curva (${ej}). DECLARA la probabilidad que de verdad creas, sin inflarla: la `+
+            `corrección se aplica encima, así que inflarla la deja peor. Y si un plan solo `+
+            `sale rentable con la probabilidad sin corregir, no lo propongas.`
+          : `Tu confianza declarada está razonablemente alineada con tu acierto real `+
+            `(${Math.round(c.probabilidad_media_declarada*100)}% contra `+
+            `${Math.round(c.acierto_real*100)}%). Mantén el criterio.`};})(),
+    /* Lo que enseñan TODOS los análisis archivados, no los tres últimos. */
+    lo_que_llevas_aprendido:memoriaAgregada(),
     tu_marcador:{total:comp(sc.total),
       por_plazo:{corto:comp(sc.porPlazo.corto),medio:comp(sc.porPlazo.medio)},
       por_direccion:{largo:comp(sc.porDireccion.largo),corto:comp(sc.porDireccion.corto)}},
@@ -4512,7 +4691,14 @@ function archivarAnalisis(d,model){
       return o&&Number.isFinite(o.atrPct)?+(o.atrPct*100).toFixed(3):null;})(),
     motor:{prob:+S.prob.toFixed(3), z:+S.zRaw.toFixed(3), tech:+S.tech.toFixed(3),
       pos:+S.pos.toFixed(3), fund:+S.fund.toFixed(3), conv:+S.conv.toFixed(3),
-      trampa:S.trap&&S.trap.activa?(S.trap.dir===1?"alcista":"bajista"):null},
+      trampa:S.trap&&S.trap.activa?(S.trap.dir===1?"alcista":"bajista"):null,
+      /* Contexto del momento: sin esto no se puede segmentar el desempeño y la
+         retroalimentación se queda en un promedio global que no enseña nada. */
+      regimen:S.hmm&&S.hmm.estado?S.hmm.estado:null,
+      adx:Number.isFinite(S.adx)?+S.adx.toFixed(1):null,
+      vpin:S.vpinNivel===null||S.vpinNivel===undefined?null:+S.vpinNivel.toFixed(3),
+      caza:S.caza&&S.caza.activa?(S.caza.dir===1?"alcista":"bajista"):null,
+      macro:S.macroEv&&S.macroEv.regimen?S.macroEv.regimen:null},
     escenarios:(d.escenarios||[]).slice(0,3).map(x=>({n:corta(x.nombre,40),p:corta(x.probabilidad,12)})),
     props:0};
 
@@ -4577,6 +4763,11 @@ function archivarAnalisis(d,model){
       entry:en, stop:st, t1:o1, t2:o2, riesgo,
       rr1:Math.abs(o1-en)/riesgo, rr2:o2!==null?Math.abs(o2-en)/riesgo:null,
       pIA:pIA!==null?clamp(pIA,0.01,0.99):null,
+      /* La calibrada se guarda AL ARCHIVAR, con la curva vigente en ese
+         momento. Así el marcador puede comparar después cuál de las dos
+         predijo mejor, que es la única prueba de que la corrección sirve. */
+      pCal:(()=>{const c=calibrarIA();
+        return pIA!==null?pCalibradaIA(clamp(pIA,0.01,0.99),c):null;})(),
       condicional:/esperar/.test(dirTxt),
       pxAlta:px, estado:"pendiente", tFill:null, tRes:null, resultadoR:null,
       dueFill:now+ms*CFG.hist.barrasLlenado[plazo],
@@ -6056,12 +6247,52 @@ function renderMarcador(){
   const box=$("marcadorBox"); if(!box)return;
   if(!S.gemTrades.length){
     box.innerHTML=`<div class="note">Todavía no hay propuestas archivadas. Genera un análisis y
-      cada entrada que proponga entrará aquí en seguimiento automático.</div>`;return;}
+      cada entrada que proponga entrará aquí en seguimiento automático. A partir de
+      ${CFG.iaCal.minN} entradas resueltas, la app empieza a corregir sola las probabilidades
+      que declara la IA.</div>`;return;}
   const sc=S.gemScore||puntuarIA();
   const T=sc.total;
   const C=(k,v,c="")=>`<div class="cell"><div class="k">${k}</div><div class="v ${c}">${v}</div></div>`;
   const pc=v=>v===null?"—":Math.round(v*100)+"%";
   const R=v=>v===null?"—":(v>0?"+":"")+v.toFixed(2)+"R";
+  /* Bloque de autocalibración: qué corrección se está aplicando y qué ha
+     aprendido de todos sus análisis, no solo de los últimos. */
+  const bloqueCal=(()=>{
+    const c=calibrarIA();
+    if(!c.suficiente)
+      return `<div class="note"><b>Autocalibración de la IA:</b> ${c.nota} Hasta llegar a
+        ${c.minimo} entradas resueltas, sus probabilidades van tal cual las declara.</div>`;
+    const ej=[0.5,0.6,0.7,0.8].map(p=>
+      `<tr><td>${Math.round(p*100)}%</td><td><b>${Math.round(pCalibradaIA(p,c)*100)}%</b></td></tr>`).join("");
+    const M=memoriaAgregada();
+    const flojos=[];
+    if(M)for(const k in M){
+      const g=M[k];
+      if(g&&g.segmentos)for(const sk in g.segmentos){
+        const x=g.segmentos[sk];
+        if(x.fiable&&x.acierto<0.35)flojos.push(`${g.nombre} = ${sk} (${Math.round(x.acierto*100)}%, n=${x.n})`);}}
+    return `<h3 style="margin:14px 0 6px;font-size:13px">Autocalibración de la IA</h3>
+      <div class="${c.sesgo_de_confianza>0.08?"warnbox":"okbox"}">
+        Declara de media <b>${pc(c.probabilidad_media_declarada)}</b> y consigue
+        <b>${pc(c.acierto_real)}</b> sobre ${c.n} entradas resueltas.
+        ${c.sesgo_de_confianza>0.08
+          ? `Sobreestima ${Math.round(c.sesgo_de_confianza*100)} puntos, así que la app corrige
+             sus probabilidades antes de mostrarlas.`
+          : `Su confianza está alineada con su acierto: la corrección es mínima.`}
+        ${c.encogimiento<1?`<br><span style="color:var(--muted)">Corrección aplicada al
+          ${Math.round(c.encogimiento*100)}% por muestra corta: crece sola según se acumulen
+          resoluciones.</span>`:""}</div>
+      <div style="overflow-x:auto"><table class="tbl">
+        <thead><tr><th>Si declara</th><th>Se lee como</th></tr></thead><tbody>${ej}</tbody></table></div>
+      ${flojos.length?`<div class="warnbox"><b>Dónde falla de forma sistemática:</b><br>
+        ${flojos.map(f=>"· "+f).join("<br>")}<br>
+        <span style="color:var(--muted)">Estos segmentos viajan en cada análisis con la
+        instrucción de reconocerlos y bajar la probabilidad cuando el contexto de hoy caiga
+        en uno de ellos.</span></div>`:""}
+      ${M?`<div class="note">Memoria acumulada: <b>${M.analisis_archivados}</b> análisis y
+        <b>${M.entradas_resueltas}</b> entradas resueltas${M.desde?` desde ${M.desde}`:""}.
+        Al modelo no le llegan los análisis uno a uno —no cabrían— sino este resumen partido por
+        sesgo, convicción, régimen, trampa y horizonte.</div>`:""}`;})();
 
   const fila=g=>g&&g.n?`<td>${g.n}</td><td>${g.resueltas}</td>
     <td class="${g.tasa>0.5?"pos":g.tasa<0.4?"neg":"neu"}">${pc(g.tasa)}</td>
@@ -6107,6 +6338,7 @@ function renderMarcador(){
       no se juzga a nadie. A partir de 6 el marcador empieza a decir algo, y de 15 en adelante
       es material para corregir.</div>`:""}
     ${avisos.length?`<div class="warnbox">${avisos.join("<br>")}</div>`:""}
+    ${bloqueCal}
     <div style="overflow-x:auto;margin-top:10px"><table class="tbl">
       <thead><tr><th>Corte</th><th>n</th><th>Resueltas</th><th>Acierto</th><th>Expectativa</th><th>Sin tocar</th></tr></thead>
       <tbody>
@@ -8302,11 +8534,33 @@ function compactarSnapshot(snap){
   limpiarNotas(c);
   if(c.autoevaluacion){
     const a=c.autoevaluacion;
+    /* BUG CORREGIDO · la compactación tiraba justo el dato que hace falta para
+       juzgar. Conservaba la variación punto a punto y borraba el máximo y el
+       mínimo alcanzados, que es lo único que dice si la tesis fue buena. Con el
+       ajuste de tamaño de la v9.2 la compactación se aplica SIEMPRE, así que el
+       modelo se habría quedado permanentemente ciego al recorrido.
+       El recorrido es lo ÚLTIMO que se recorta, no lo primero. */
     if(a.tus_analisis_anteriores)a.tus_analisis_anteriores=a.tus_analisis_anteriores.slice(0,3)
       .map(x=>({cuando:x.cuando,hace_horas:x.hace_horas,peso_por_antiguedad:x.peso_por_antiguedad,
-        sesgo_que_dio:x.sesgo_que_dio,movimiento_desde_entonces_pct:x.movimiento_desde_entonces_pct,
-        acerto_la_direccion:x.acerto_la_direccion}));
+        sesgo_que_dio:x.sesgo_que_dio,
+        maximo_alcanzado_pct:x.maximo_alcanzado_pct,
+        minimo_alcanzado_pct:x.minimo_alcanzado_pct,
+        excursion_a_favor_de_tu_sesgo_pct:x.excursion_a_favor_de_tu_sesgo_pct,
+        variacion_punto_a_punto_pct:x.variacion_punto_a_punto_pct,
+        acerto_la_direccion:x.acerto_la_direccion,
+        como_juzgarlo:"El recorrido manda sobre el punto a punto: cita el maximo alcanzado, "+
+          "no solo la variacion punto a punto."}));
     if(a.tus_mejoras_propuestas)a.tus_mejoras_propuestas=a.tus_mejoras_propuestas.slice(0,4);
+    /* tu_calibracion y lo_que_llevas_aprendido NO se tocan: son el aprendizaje
+       acumulado y pesan un par de KB. Lo que se recorta son los segmentos sin
+       muestra suficiente, que además no deben usarse. */
+    if(a.lo_que_llevas_aprendido){
+      const L=a.lo_que_llevas_aprendido;
+      for(const k in L){
+        if(L[k]&&L[k].segmentos){
+          const f={};
+          for(const sk in L[k].segmentos)if(L[k].segmentos[sk].fiable)f[sk]=L[k].segmentos[sk];
+          L[k].segmentos=Object.keys(f).length?f:L[k].segmentos;}}}
     delete a.catalogo_de_algoritmos;
     if(a.banco_de_pruebas&&a.banco_de_pruebas.bloques)
       a.banco_de_pruebas={compuesto:a.banco_de_pruebas.compuesto,bloques:a.banco_de_pruebas.bloques};}
@@ -8317,6 +8571,32 @@ function compactarSnapshot(snap){
 
 const GEM_SYS=`Eres un analista senior de derivados cripto especializado en WLD (World Network),
 escribiendo un informe operativo completo para un trader profesional en español de Colombia.
+
+AUTOCALIBRACION · ESTO NO ES DECORATIVO
+· tu_calibracion trae la curva con la que la app YA corrige tus probabilidades, medida sobre tus
+  propias entradas resueltas. Lee su campo instruccion y obedecelo. Declara la probabilidad que
+  de verdad creas: inflarla no te beneficia porque la correccion se aplica encima.
+· lo_que_llevas_aprendido resume TODOS tus analisis archivados partidos por sesgo, conviccion,
+  regimen, trampa y horizonte. ANTES de fijar el sesgo, busca el segmento que te toca hoy:
+  - si tu acierto historico en ese segmento esta por debajo de 0,35, estas a punto de repetir un
+    error conocido: dilo explicitamente en la tesis y baja la probabilidad que declares;
+  - si esta por encima de 0,55, es tu terreno y puedes sostener la conviccion;
+  - ignora todo segmento con fiable=false, sin excepcion.
+· Esta PROHIBIDO escribir un informe sin haber mirado el segmento que corresponde al estado
+  actual. Si el contexto de hoy cae en un segmento donde fallas, y aun asi mantienes el sesgo,
+  tienes que justificar por escrito que ha cambiado.
+
+AUTOCRITICA · COMO SE MIDE UN ACIERTO
+Cada analisis anterior trae maximo_alcanzado_pct y minimo_alcanzado_pct ademas de
+variacion_punto_a_punto_pct. El recorrido MANDA sobre el punto final:
+· Describir el resultado citando solo la variacion punto a punto esta PROHIBIDO. Si diste sesgo
+  alcista a 0,4328 y el precio toco 0,4537 antes de volver a 0,4368, acertaste con un +4,83% de
+  recorrido, no con un +0,92%: decir "+0,92%" subestima tu propio acierto cinco veces y te lleva
+  a corregir una tesis que estaba bien.
+· Al reves: si la excursion en contra fue grande, la tesis NO era operable aunque el precio haya
+  vuelto al punto de partida, porque un stop razonable habria saltado. Dilo asi.
+· Al revisar tus entradas, comprueba contra maximo/minimo si el objetivo se toco en el camino,
+  no solo si el precio esta ahora por encima o por debajo.
 
 CANTIDADES OBLIGATORIAS (el esquema ya no las impone, las impone esta regla):
    lectura 7 a 10 bloques · escenarios 3 o 4 · entradas_corto 2 o 3 · entradas_medio 1 o 2 ·
@@ -9184,6 +9464,9 @@ REGLAS:
    SIEMPRE como |objetivo - entrada| / |entrada - stop|.
 7. No prometes resultados ni das seguridades. Hablas de probabilidades y de que invalida cada tesis.
 8. Si el marcador muestra que sobreestimas probabilidades, tenlo en cuenta al dar porcentajes.
+9ter. Para juzgar tu informe anterior usa \`ultimo_informe.maximo_alcanzado_pct\` y
+   \`minimo_alcanzado_pct\`, NUNCA la diferencia entre precio_entonces y el precio actual. Un
+   movimiento que llego a +4,8% y volvio a +0,9% es un acierto de 4,8%, no de 0,9%.
 9bis. El campo \`recorrido_reciente\` manda sobre cualquier indicador cuando se trata de describir
    qué está haciendo el precio. Un sesgo que contradiga la estructura del recorrido hay que
    justificarlo por escrito en la misma frase, o no se emite. En la autocrítica, compara tu tesis
@@ -9369,9 +9652,24 @@ function contextoChat(){
   const ult=S.gemHist[0];
   return{
     estado_en_vivo:snap,
-    ultimo_informe:ult?{cuando:fechaHora(ult.t),sesgo:ult.sesgo,conviccion:ult.conviccion,
-      precio_entonces:ult.px,tesis:ult.tesis,
-      nota:"Es tu propio informe anterior. No te contradigas sin explicar que cambio."}:null,
+    ultimo_informe:ult?(()=>{
+      /* El chat juzgaba su informe anterior con precio_entonces contra el precio
+         de ahora, el mismo punto ciego que el informe: sin el camino, un acierto
+         de +4,8% que retrocede a +0,9% se cuenta como +0,9%. */
+      const R=recorridoDesde(ult.t,ult.px);
+      const base={cuando:fechaHora(ult.t),sesgo:ult.sesgo,conviccion:ult.conviccion,
+        precio_entonces:ult.px,tesis:ult.tesis,
+        nota:"Es tu propio informe anterior. No te contradigas sin explicar que cambio."};
+      if(!R)return base;
+      const r2=v=>+v.toFixed(2);
+      return Object.assign(base,{
+        maximo_alcanzado_pct:r2(R.maxSubida), minimo_alcanzado_pct:r2(R.maxBajada),
+        precio_maximo:+R.max.toFixed(5), precio_minimo:+R.min.toFixed(5),
+        rango_recorrido_pct:r2(R.rango), cobertura_parcial:!!R.parcial,
+        como_juzgarlo:"Para decir si aquella tesis acerto, usa el RECORRIDO: maximo y minimo "+
+          "alcanzados desde entonces. Esta PROHIBIDO juzgarla solo con la diferencia entre "+
+          "precio_entonces y el precio de ahora: el precio pudo subir mucho y volver, y eso "+
+          "es un acierto de la magnitud del maximo, no de la diferencia final."});})():null,
     tu_marcador:{propuestas:sc.total.n,resueltas:sc.total.resueltas,
       acierto:sc.total.tasa===null?null:+sc.total.tasa.toFixed(3),
       expectativa_R:sc.total.expectativaR===null?null:+sc.total.expectativaR.toFixed(2),
