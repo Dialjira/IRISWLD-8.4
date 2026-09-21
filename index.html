@@ -969,7 +969,9 @@ const S={
   openRatio:null, probRaw:0.5, zRaw:0, corrDamp:1, volGate:1,
   planCal:{}, blockPerf:{}, shadow:{n:0,win:0,pending:[]},
   planPending:[], diag:{ok:true,items:[],errs:{},t:0},
-  fresh:{kl:0,meta:0,derivs:0,btc:0,ws:0,wsSpot:0,wsMark:0,wsLead:0,wsBook:0},
+  /* ws = el socket está vivo · wsTrade = además llegan operaciones. No es lo
+     mismo y confundirlo declaraba caído un socket sano en un par ilíquido. */
+  fresh:{kl:0,meta:0,derivs:0,btc:0,ws:0,wsTrade:0,wsSpot:0,wsMark:0,wsLead:0,wsBook:0},
   wsState:{estado:"sin iniciar",intentos:0,msgs:0,abierto:null,cerrado:null,err:null,
            url:"",fuente:null,bloqueado:false,avisado:false,fijado:false,candidato:null,
            parcial:false,porTipo:null,ultimoMsg:null},
@@ -5105,14 +5107,23 @@ function runDiagnostics(){
   /* El flujo perp merece diagnóstico propio: decir "nunca llegó" no distingue
      entre socket que no abre, socket abierto sin tráfico y respaldo REST
      funcionando. Cada caso se arregla de forma distinta. */
-  const W=S.wsState, ageWs=S.fresh.ws?now-S.fresh.ws:Infinity;
+  /* ageWs mide OPERACIONES, no vida del socket: desde la corrección, fresh.ws
+     se actualiza con cualquier mensaje y fresh.wsTrade solo con aggTrade. Este
+     bloque pregunta "¿hace cuánto que no se negocia?", así que va con wsTrade. */
+  const W=S.wsState, ageWs=S.fresh.wsTrade?now-S.fresh.wsTrade:Infinity;
+  const socketVivo=S.fresh.ws&&(now-S.fresh.ws)<60000;
   if(S.restFlow.activo)
     add("warn","flujo perp",
-      `WebSocket caído (${W.estado}, ${W.intentos} intento${W.intentos===1?"":"s"}) — `+
-      `el flujo va por REST cada 15 s. CVD y cinta vivos con retardo; el mapa de `+
-      `liquidaciones ejecutadas sí se pierde, porque forceOrder solo existe por streaming.`);
+      (socketVivo
+        ? `El socket recibe (${W.msgs} mensajes${W.porTipo?": "+Object.entries(W.porTipo)
+            .map(([k,v])=>`${k} ${v}`).join(", "):""}) pero el par no registra operaciones, `+
+          `así que el respaldo REST está activo. No es una avería de conexión.`
+        : `WebSocket caído (${W.estado}, ${W.intentos} intento${W.intentos===1?"":"s"}) — `+
+          `el flujo va por REST cada 15 s.`)+
+      ` CVD y cinta vivos con retardo; el mapa de liquidaciones ejecutadas sí se pierde, `+
+      `porque forceOrder solo existe por streaming.`);
   else if(ageWs>90000){
-    const markVivo=S.fresh.wsMark&&(now-S.fresh.wsMark)<30000;
+    const markVivo=(S.fresh.wsMark&&(now-S.fresh.wsMark)<30000)||socketVivo;
     if(markVivo){
       /* Caso real de WLDUSDC: socket sano, par sin operaciones. */
       add("warn","liquidez del par",
@@ -5580,6 +5591,57 @@ function renderMicro(){
       t.buy?"compra":"venta"}</b> ${compact(t.q)} WLD · $${compact(t.usd)} @ ${f(t.p)}</div>`).join("")
     : `<div>Esperando órdenes sobre $2.000.</div>`;}
 
+/* ══════════════════════════════════════════════════════════════════════
+   COMBUSTIBLE EN EL CAMINO
+   La pregunta que el mapa no respondía: "si el precio va de aquí a 0,4520,
+   ¿cuánta liquidación se quema por el camino?". Ver los racimos sueltos no lo
+   dice; hay que integrarlos entre dos precios.
+   Devuelve el acumulado y el racimo más gordo del tramo, que es donde el
+   movimiento se acelera o se para.
+   ══════════════════════════════════════════════════════════════════════ */
+function combustibleEntre(p0,p1){
+  const M=S.liqMap;
+  if(!M||!Number.isFinite(p0)||!Number.isFinite(p1))return null;
+  const lo=Math.min(p0,p1), hi=Math.max(p0,p1);
+  /* MATIZ QUE DESCUBRIÓ LA PRUEBA · no todo racimo del tramo es combustible
+     del movimiento. Un racimo de CORTOS se liquida cuando el precio SUBE hasta
+     él; uno de LARGOS, cuando BAJA. Contando los dos lados, un recorrido hacia
+     abajo sumaba racimos de cortos que quedaban por encima y que no empujan esa
+     caída: en la prueba inflaba el combustible de 428K a 884K, más del doble.
+     Se cuenta solo el lado que el movimiento de verdad ejecuta. */
+  const subiendo=p1>=p0;
+  const dentro=(M.clusters||[]).filter(c=>c.p>=lo&&c.p<=hi&&
+    (subiendo?c.side!=="long":c.side!=="short"));
+  if(!dentro.length)return{usd:0,n:0,mayor:null,lo,hi};
+  let usd=0,mayor=dentro[0];
+  for(const c of dentro){usd+=c.usd; if(c.usd>mayor.usd)mayor=c;}
+  return{usd,n:dentro.length,mayor,lo,hi,
+    /* Cuánto de todo el combustible del mapa está en este tramo */
+    fraccion:(()=>{const tot=(M.clusters||[]).reduce((a,c)=>a+c.usd,0);
+      return tot>0?usd/tot:0;})()};}
+
+/* Estado de la interacción del mapa. Vive aparte del motor: tocarlo no
+   recalcula nada, solo cambia lo que se mira. */
+S.liqUI={px:null, ventana:0.14, minUsd:0, t:0};
+
+function liqMapToque(ev){
+  const cv=$("liqMapCv"); if(!cv||!S.liqMap||!S.last)return;
+  const r=cv.getBoundingClientRect();
+  const t=(ev.touches&&ev.touches[0])||ev;
+  const x=t.clientX-r.left;
+  const V=S.liqUI.ventana;
+  const lo=S.last*(1-V), hi=S.last*(1+V);
+  const PL=6,PR=58;
+  const iw=r.width-PL-PR;
+  const frac=clamp((x-PL)/iw,0,1);
+  S.liqUI.px=lo+frac*(hi-lo);
+  S.liqUI.t=Date.now();
+  renderLiqMap();}
+
+function liqMapLimpiar(){S.liqUI.px=null; renderLiqMap();}
+function liqMapVentana(v){S.liqUI.ventana=v; renderLiqMap();}
+function liqMapFiltro(u){S.liqUI.minUsd=u; renderLiqMap();}
+
 function renderLiqMap(){
   const M=S.liqMap, C=(k,v,c="")=>`<div class="cell"><div class="k">${k}</div>
     <div class="v ${c}">${v}</div></div>`;
@@ -5589,34 +5651,93 @@ function renderLiqMap(){
     $("liqMapBox").innerHTML=C("Mapa","sin datos");
     $("liqMagnet").innerHTML=""; $("liqClusters").innerHTML=""; return;}
   // dibujo: histograma horizontal centrado en el precio
-  const{g,w,h}=fitCanvas(cv,160);
+  const{g,w,h}=fitCanvas(cv,190);
   g.clearRect(0,0,w,h);
-  const lo=S.last*0.86, hi=S.last*1.14;         // ventana operativa ±14%
+  const V=S.liqUI.ventana||0.14;
+  const lo=S.last*(1-V), hi=S.last*(1+V);       // ventana ajustable por el usuario
   const PL=6,PR=58,PT=6,PB=6, iw=w-PL-PR, ih=h-PT-PB;
   const X=p=>PL+(p-lo)/(hi-lo)*iw;
   const inRange=i=>{const p=M.lo+(i+.5)/M.bins*(M.hi-M.lo); return p>lo&&p<hi;};
   const bwpx=iw/((hi-lo)/((M.hi-M.lo)/M.bins));
+  /* Máximo dentro de la ventana visible: con ±5% el pico global puede quedar
+     fuera y todas las barras salían aplastadas contra el suelo. */
+  let maxv=0;
+  for(let i=0;i<M.bins;i++)if(inRange(i))maxv=Math.max(maxv,M.arrL[i],M.arrS[i]);
+  maxv=maxv||M.maxv||1;
+  /* Extremo de datos redondeado y 2px de separación entre barras. */
+  const barra=(x,y,ancho,alto,color)=>{
+    g.fillStyle=color;
+    const r=Math.min(4,ancho/2,alto);
+    if(g.roundRect){g.beginPath(); g.roundRect(x,y,ancho,alto,[r,r,0,0]); g.fill();}
+    else g.fillRect(x,y,ancho,alto);};
   for(let i=0;i<M.bins;i++){
     if(!inRange(i))continue;
     const p=M.lo+(i+.5)/M.bins*(M.hi-M.lo), x=X(p);
-    const hL=(M.arrL[i]/M.maxv)*ih, hS=(M.arrS[i]/M.maxv)*ih;
-    if(hL>0.4){g.fillStyle="rgba(242,97,122,.62)";
-      g.fillRect(x-bwpx/2,PT+ih-hL,Math.max(1.5,bwpx*.85),hL);}
-    if(hS>0.4){g.fillStyle="rgba(63,214,139,.62)";
-      g.fillRect(x-bwpx/2,PT+ih-hS,Math.max(1.5,bwpx*.85),hS);}}
+    const anch=Math.max(1.5,bwpx-2);            // 2px de aire entre barras
+    const hL=(M.arrL[i]/maxv)*ih, hS=(M.arrS[i]/maxv)*ih;
+    if(hL>0.4)barra(x-anch/2,PT+ih-hL,anch,hL,"rgba(242,97,122,.62)");
+    if(hS>0.4)barra(x-anch/2,PT+ih-hS,anch,hS,"rgba(63,214,139,.62)");}
+
+  /* ── Capa de toque: el tramo entre el precio y el punto tocado ── */
+  const tocado=S.liqUI.px;
+  if(Number.isFinite(tocado)&&tocado>lo&&tocado<hi){
+    const xt=X(tocado), xp0=X(S.last);
+    g.save();
+    g.fillStyle="rgba(232,163,61,.10)";
+    g.fillRect(Math.min(xp0,xt),PT,Math.abs(xt-xp0),ih);
+    g.strokeStyle="rgba(232,163,61,.85)"; g.lineWidth=1.4;
+    g.beginPath(); g.moveTo(xt,PT); g.lineTo(xt,PT+ih); g.stroke();
+    g.restore();}
   const xp=X(S.last);
   g.save(); g.setLineDash([3,3]); g.strokeStyle="#E8A33D"; g.lineWidth=1.6;
   g.beginPath(); g.moveTo(xp,PT); g.lineTo(xp,PT+ih); g.stroke(); g.restore();
   g.fillStyle="#E8A33D"; g.font="600 10px 'IBM Plex Mono',monospace"; g.textAlign="center";
   g.fillText(S.last.toFixed(4),xp,PT+10);
   g.textAlign="left"; g.fillStyle="#5C6678"; g.font="9px 'IBM Plex Mono',monospace";
-  g.fillText("−14%",PL,PT+ih-2); g.textAlign="right"; g.fillText("+14%",PL+iw,PT+ih-2);
+  g.fillText("−"+(V*100).toFixed(0)+"%",PL,PT+ih-2);
+  g.textAlign="right"; g.fillText("+"+(V*100).toFixed(0)+"%",PL+iw,PT+ih-2);
   g.textAlign="left";
   g.fillStyle="rgba(242,97,122,.9)"; g.fillText("largos",PL+iw+6,PT+12);
   g.fillStyle="rgba(63,214,139,.9)"; g.fillText("cortos",PL+iw+6,PT+26);
 
   const nb=M.below[0], na=M.above[0];
-  $("liqMapBox").innerHTML=
+  /* ── BARRA DE BALANCE ──
+     La validación de paleta reveló que el verde de cortos es más luminoso que
+     el rosa de largos (0,78 contra 0,68), así que a igualdad de masa el lado
+     verde PARECE mayor. En un mapa cuya función es comparar dos masas, eso
+     sesga la lectura. La respuesta no es recolorear media app: es no obligar a
+     nadie a integrar áreas de colores distintos a ojo. Esta barra da la
+     proporción directamente. */
+  const balance=(()=>{
+    const tot=M.mBelow+M.mAbove;
+    if(!(tot>0))return "";
+    const pAb=M.mBelow/tot*100;
+    return `<div style="grid-column:1/-1;margin:2px 0 6px">
+      <div style="display:flex;height:16px;border-radius:4px;overflow:hidden;
+        background:var(--line)">
+        <div style="width:${pAb.toFixed(1)}%;background:rgba(242,97,122,.75)"></div>
+        <div style="width:2px;background:var(--bg)"></div>
+        <div style="flex:1;background:rgba(63,214,139,.75)"></div></div>
+      <div class="mono" style="font-size:10px;color:var(--muted);display:flex;
+        justify-content:space-between;margin-top:3px">
+        <span>abajo ${pAb.toFixed(0)}%</span>
+        <span>arriba ${(100-pAb).toFixed(0)}%</span></div></div>`;})();
+  /* ══ ACTUALIZACIÓN ATÓMICA ══
+     BUG CORREGIDO · en pantalla aparecían dos cifras distintas para lo mismo:
+     las tarjetas decían "masa arriba $290,1K · tirón −23%" mientras el párrafo
+     de debajo decía "$638,2K por encima · desequilibrio del 58%".
+     Las dos salen de las MISMAS variables, así que no podían discrepar… salvo
+     que vinieran de renders distintos. Y eso es justo lo que pasaba: las
+     tarjetas se asignaban al DOM al principio de la función y el texto al
+     final. Si algo lanzaba entre medias —el render va dentro de un try/catch
+     que se traga el error en S.diag.errs— las tarjetas quedaban actualizadas y
+     el párrafo se quedaba con el contenido del ciclo anterior. La pantalla
+     mezclaba dos instantes y ninguno de los dos números era mentira por
+     separado.
+     Ahora se construye todo el HTML primero y se asigna al final, de una vez.
+     Si algo falla, no se toca nada y la pantalla queda coherente. */
+  const htmlTarjetas=
+    balance+
     C("Masa abajo ±12%","$"+compact(M.mBelow),"neg")+
     C("Masa arriba ±12%","$"+compact(M.mAbove),"pos")+
     C("Tirón neto",(M.pull*100).toFixed(0)+"% "+(M.pull>0?"abajo":"arriba"),
@@ -5625,6 +5746,32 @@ function renderLiqMap(){
     C("Distancia",nb?((nb.p-S.last)/S.last*100).toFixed(2)+"%":"—","neg")+
     C("Racimo arriba",na?f(na.p):"—")+
     C("Distancia",na?((na.p-S.last)/S.last*100).toFixed(2)+"%":"—","pos");
+
+  /* ── Panel del tramo tocado ── */
+  const panelToque=(()=>{
+    const p=S.liqUI.px;
+    if(!Number.isFinite(p))
+      return `<div class="note">Toca el mapa en cualquier precio y te digo cuánta liquidación
+        hay entre el precio actual y ese punto. Es el combustible que el movimiento tendría que
+        quemar para llegar ahí.</div>`;
+    const F=combustibleEntre(S.last,p);
+    if(!F)return "";
+    const d=((p-S.last)/S.last)*100;
+    const arriba=p>S.last;
+    return `<div class="${F.usd>0?"okbox":"note"}" style="margin-top:6px">
+      <b>De ${f(S.last)} a ${f(p)}</b> · ${d>0?"+":""}${d.toFixed(2)}%<br>
+      ${F.n
+        ? `En el camino hay <b>$${compact(F.usd)}</b> en ${F.n} racimo${F.n===1?"":"s"} de
+           liquidación (${(F.fraccion*100).toFixed(0)}% de todo el combustible del mapa).
+           El mayor está en <b>${f(F.mayor.p)}</b> con $${compact(F.mayor.usd)}:
+           ${arriba
+             ? "si el precio sube, ahí es donde los cortos se ven forzados a comprar y el impulso se acelera."
+             : "si el precio baja, ahí es donde los largos se ven forzados a vender y la caída se acelera."}`
+        : `No hay racimos estimados en ese tramo: el precio recorrería esa distancia
+           sin combustible de liquidaciones que lo empuje.`}
+      <div class="bar" style="margin-top:6px">
+        <button onclick="addAlert(${p.toFixed(5)},'Objetivo del mapa')">Alerta en ${f(p)}</button>
+        <button onclick="liqMapLimpiar()">Quitar</button></div></div>`;})();
 
   let n="";
   if(Math.abs(M.pull)>0.18){
@@ -5652,14 +5799,42 @@ function renderLiqMap(){
       ${(M.pullAdj*100).toFixed(0)}% ${M.pullAdj>0?"abajo":"arriba"}, no
       ${(M.pull*100).toFixed(0)}%. Es la firma de un mercado ya ${dn?"vendido":"comprado"},
       no una señal direccional por sí sola.`;}
-  $("liqMagnet").innerHTML=n;
+  /* Sello de instante: si las tarjetas y el texto salieran de momentos
+     distintos, aquí se vería. Antes el mapa solo se repintaba al entrar a la
+     pestaña, así que podías estar leyendo cifras de hace minutos junto a un
+     precio de ahora. */
+  const htmlTexto=panelToque+n+
+    `<div class="mono" style="font-size:10px;color:var(--muted);margin-top:6px">
+      Mapa calculado con el precio ${f(S.last)} · ${hhmm(Date.now())} ·
+      ${(M.clusters||[]).length} racimos${S.liqUI.minUsd?` · filtro ≥ $${compact(S.liqUI.minUsd)}`:""}</div>`;
 
-  $("liqClusters").innerHTML=[...M.above].reverse().concat(M.below).slice(0,10).map(c=>{
+  /* Filtro de tamaño: lo pidió el propio analista — "demasiados racimos
+     pequeños que generan ruido". Se filtra en la LISTA, no en el cálculo: el
+     motor sigue usando todos, porque quitarlos del mapa cambiaría el tirón. */
+  const visibles=[...M.above].reverse().concat(M.below)
+    .filter(c=>!S.liqUI.minUsd||c.usd>=S.liqUI.minUsd);
+  const htmlRacimos=
+    `<div class="bar" style="margin-bottom:6px">
+      <span class="mono" style="font-size:10.5px;color:var(--muted);align-self:center">Ventana</span>
+      ${[0.05,0.14,0.25].map(v=>`<button onclick="liqMapVentana(${v})"
+        ${Math.abs(S.liqUI.ventana-v)<1e-9?'class="act"':""}>±${(v*100).toFixed(0)}%</button>`).join("")}
+      <span class="mono" style="font-size:10.5px;color:var(--muted);align-self:center">Mínimo</span>
+      ${[0,50000,150000].map(u=>`<button onclick="liqMapFiltro(${u})"
+        ${S.liqUI.minUsd===u?'class="act"':""}>${u?"$"+compact(u):"todos"}</button>`).join("")}
+    </div>`+
+    (visibles.length?"":`<div class="note">Ningún racimo supera el filtro. Baja el mínimo.</div>`)+
+    visibles.slice(0,10).map(c=>{
     const d=(c.p-S.last)/S.last*100;
     return `<div class="lvl" onclick="addAlert(${c.p},'Racimo liq.')" style="cursor:pointer">
       <span class="${c.side==="long"?"neg":"pos"}">${f(c.p)}</span>
       <span class="src">liq. ${c.side==="long"?"largos":"cortos"} · ~$${compact(c.usd)}</span>
-      <span class="neu">${d>0?"+":""}${d.toFixed(2)}%</span></div>`;}).join("");}
+      <span class="neu">${d>0?"+":""}${d.toFixed(2)}%</span></div>`;}).join("");
+
+  /* Las tres asignaciones juntas y al final: la pantalla no puede quedar a
+     medias entre dos ciclos. */
+  $("liqMapBox").innerHTML=htmlTarjetas;
+  $("liqMagnet").innerHTML=htmlTexto;
+  $("liqClusters").innerHTML=htmlRacimos;}
 
 function renderVolume(){
   const o=S.ind[S.tf], C=(k,v,c="")=>`<div class="cell"><div class="k">${k}</div>
@@ -7374,9 +7549,25 @@ function connectWS(){
     const tipo=d.e||(d.b!==undefined&&d.a!==undefined?"bookTicker":"otro");
     S.wsState.porTipo=S.wsState.porTipo||{};
     S.wsState.porTipo[tipo]=(S.wsState.porTipo[tipo]||0)+1;
+    /* ══ EL MISMO BUG DE LA v8.4, EN OTRA FUNCIÓN ══
+       Allí arreglé el CONTADOR de mensajes para que sumara cualquier tipo, y me
+       dejé sin arreglar el detector de flujo degradado, que decide con
+       S.fresh.ws — una marca que solo se tocaba dentro de la rama de aggTrade.
+       En WLDUSDC, con el 4,6% del interés abierto, pueden pasar minutos sin una
+       sola operación mientras el bookTicker llega sin parar. Resultado en
+       pantalla: la cabecera decía "WebSocket · 10260 mensajes · recibiendo" y
+       el diagnóstico, dos dedos más abajo, "WebSocket caído, recibiendo solo
+       bookTicker por REST". Las dos cosas a la vez, y la bitácora oscilando
+       entre "sin WebSocket" y "WebSocket estable de nuevo" cada pocos minutos.
+       Peor aún: ese falso degradado es lo que BLOQUEA la auditoría del motor.
+       Ahora se separan las dos cosas, que nunca fueron la misma:
+         fresh.ws      · el socket está vivo (llega algo, lo que sea)
+         fresh.wsTrade · hay operaciones (llega aggTrade)
+       Un par sin operaciones tiene el socket perfectamente sano. */
+    S.fresh.ws=Date.now();
     if(d.e==="aggTrade"){
       const q=+d.q, price=+d.p, usd=q*price;
-      S.fresh.ws=Date.now();
+      S.fresh.wsTrade=Date.now();
       /* ventana de 45 s para medir absorción: cuánto volumen agresor entra y
          cuánto avanza realmente el precio */
       if(!S.absorb||Date.now()-S.absorb.t>45000)
@@ -7485,8 +7676,17 @@ async function pollFlowREST(){
   /* Socket sano con marcas llegando = no hay nada que rescatar por REST: el
      par simplemente no tiene operaciones. Sondear REST en ese caso solo
      inventa actividad y llena la bitácora. */
+  /* El socket está vivo si llega CUALQUIER mensaje: marcas, libro u
+     operaciones. Antes solo contaban las operaciones y las marcas, así que un
+     par ilíquido con el libro llegando sin parar se declaraba caído. */
   const markVivo=S.fresh.wsMark&&(Date.now()-S.fresh.wsMark)<30000;
-  const wsVivo=(S.fresh.ws&&(Date.now()-S.fresh.ws)<60000&&S.wsState.fuente==="ws")||markVivo;
+  const bookVivo=S.fresh.wsBook&&(Date.now()-S.fresh.wsBook)<45000;
+  const tradeVivo=S.fresh.wsTrade&&(Date.now()-S.fresh.wsTrade)<60000;
+  const wsVivo=(S.wsState.fuente==="ws"&&(tradeVivo||markVivo||bookVivo))||markVivo;
+  /* Diferencia que el diagnóstico tenía que haber hecho desde el principio:
+     socket sano sin operaciones NO es una avería, y sondear REST no va a
+     inventar trades que no existen. */
+  S.flujoSinTrades=wsVivo&&!tradeVivo;
   /* Histéresis: hacen falta 3 sondeos seguidos sin WebSocket para declarar el
      modo degradado, y 2 con WebSocket vivo para volver. Sin esto el flujo
      parpadeaba cada 15 s y llenaba la bitácora de "sin WebSocket / WebSocket
@@ -7507,7 +7707,8 @@ async function pollFlowREST(){
     if(!S.restFlow.activo){S.restFlow.activo=true;
       S.restFlow.desde=Date.now();
       S.restFlow.caidas=(S.restFlow.caidas||0)+1;
-      addLog(`<b>Sin WebSocket</b> tras ${S.restFlow.fallos} sondeos · flujo por REST cada 15 s. `+
+      addLog(`<b>${S.flujoSinTrades?"Sin operaciones en el par":"Sin WebSocket"}</b> tras `+
+        `${S.restFlow.fallos} sondeos · flujo por REST cada 15 s. `+
         `CVD y cinta siguen vivos con retardo.`+
         (S.restFlow.caidas>3?` Van ${S.restFlow.caidas} caídas: si abriste el archivo desde `+
           `content:// el WebView corta el socket al pasar a segundo plano. Ábrelo desde Chrome.`:""));}
@@ -9222,6 +9423,7 @@ function buildAuditPayload(){
       ws_mensajes_por_tipo:S.wsState.porTipo||{},
       ws_segundos_desde_el_ultimo:S.wsState.ultimoMsg
         ?Math.round((Date.now()-S.wsState.ultimoMsg)/1000):null,
+      socket_vivo_sin_operaciones:!!S.flujoSinTrades,
       ws_nota:"Distingue dos cosas que NO son lo mismo. Socket MUERTO: no llega "+
         "ningun mensaje de ningun tipo. Par SIN OPERACIONES: llegan markPriceUpdate "+
         "y bookTicker pero pocos o ningun aggTrade, porque el par es marginal. En el "+
@@ -10936,6 +11138,22 @@ window.preguntarRapido=preguntarRapido;
   el.addEventListener("change",()=>store.set(id,el.value));
   el.addEventListener("input",()=>store.set(id,el.value));});
 window.addEventListener("resize",()=>{drawChart();drawOsc();renderLiqMap();});
+/* Toque e interacción del mapa de liquidaciones. passive:false porque arrastrar
+   el dedo sobre el mapa no debe desplazar la página. */
+window.liqMapLimpiar=liqMapLimpiar;
+window.liqMapVentana=liqMapVentana;
+window.liqMapFiltro=liqMapFiltro;
+window.combustibleEntre=combustibleEntre;
+(()=>{const cv=$("liqMapCv"); if(!cv)return;
+  let arrastrando=false;
+  const mover=e=>{if(!arrastrando)return; e.preventDefault(); liqMapToque(e);};
+  cv.addEventListener("touchstart",e=>{arrastrando=true; e.preventDefault(); liqMapToque(e);},{passive:false});
+  cv.addEventListener("touchmove",mover,{passive:false});
+  cv.addEventListener("touchend",()=>{arrastrando=false;});
+  cv.addEventListener("mousedown",e=>{arrastrando=true; liqMapToque(e);});
+  cv.addEventListener("mousemove",e=>{if(arrastrando)liqMapToque(e);});
+  window.addEventListener("mouseup",()=>{arrastrando=false;});
+  cv.style.cursor="crosshair";})();
 document.addEventListener("visibilitychange",()=>{if(!document.hidden)fullRefresh();});
 
 /* ═══ ARRANQUE ═══ */
