@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="theme-color" content="#0B0E14">
-<title>IRIS v7.1 · Monitor WLD</title>
+<title>IRIS v9.9 · Monitor WLD</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
@@ -339,6 +339,11 @@ section[data-tab].show{display:block}
       <option value="groq_solo">Solo Groq</option>
     </select>
   </div>
+  <div class="bar" style="margin-top:8px">
+    <button id="verifRun" class="act">Verificar modelos</button>
+    <button id="perfilReset">Limpiar perfiles</button>
+  </div>
+  <div id="verifBox"></div>
   <div id="modelStatsBox"></div>
   <div id="groqStatus" class="note">Opcional. Google limita la cuota por proyecto, no por modelo:
     cuando satura, satura toda la clave y ningún relevo interno sirve. Un proveedor distinto es la
@@ -652,6 +657,7 @@ section[data-tab].show{display:block}
   <div class="grid2" id="derivBox"></div>
   <div id="oiRegime" class="rationale"></div>
   <div style="overflow-x:auto;margin-top:12px"><table class="tbl" id="derivTable"></table></div>
+  <div id="neutroNota" class="rationale" style="margin-top:10px"></div>
 </section>
 
 <!-- 10 CONTEXTO BTC -->
@@ -907,6 +913,17 @@ const CFG={
   hawkes:{ventanaMs:45*60000, minEventos:14, minFiable:40, refrescoMs:30000, critico:0.60, peso:0.07},
   /* OFI sobre la mejor cotización */
   ofi:{ventana:120, minEventos:40},
+  /* ── Punto neutro del posicionamiento, aprendido ──
+     `crowd` y `whale` leían el ratio largos/cortos contra un centro congelado
+     (1,9 y 1,6). Ese número salió de observar el mercado en un momento dado y
+     no tiene por qué seguir siendo cierto: si la multitud se asienta seis meses
+     en 2,4, el motor lee "multitud larga" TODO el rato y la señal contraria
+     deja de informar. Ahora el centro se aprende de la distribución observada
+     —mediana, que no la mueve un pico— y se encoge hacia el valor de origen en
+     proporción a la muestra: con cero historia el comportamiento es idéntico al
+     de siempre, y solo se aparta cuando hay evidencia para hacerlo. */
+  neutro:{priorG:1.9, priorTP:1.6, minN:120, plenaN:1200, maxMuestras:3000,
+          desvioMax:0.45, guardaCada:6},
   /* Histéresis del detector de giros: entrar cuesta más que quedarse */
   flip:{entrada:0.015, banda:0.035, permanenciaMs:90000},
   /* Archivo de análisis y seguimiento de las propuestas de la IA */
@@ -952,7 +969,10 @@ const S={
   last:null, mark:null, index:null, chg:null, funding:null, nextFund:null,
   spot:null, basis:null,
   oi:null, oiUsd:null, oiHist:[], gAcc:[], tAcc:[], tPos:[], taker:[],
-  cvd:0, cvdSeries:[], book:null, walls:{bid:[],ask:[]},
+  /* distribución observada del ratio largos/cortos, persistida: de aquí sale
+     el punto neutro aprendido de `crowd` y `whale` (ver CFG.neutro) */
+  ratHist:{g:[],tp:[]}, neutro:null,
+  cvd:0, cvdSeries:[], book:null, walls:{bid:[],ask:[]}, vol24:null,
   liqs:[], liqLong:0, liqShort:0, liqBuckets:[],
   tape:[],
   btc:{price:null,chg:null,kl:null,corr:null,beta:null,trend:null},
@@ -1041,6 +1061,15 @@ const ORDEN_PODA=[
   ["labHist",      t=>Array.isArray(t)?t.slice(0,5):t],
   ["mejoras",      t=>Array.isArray(t)?t.slice(0,20):t],
   ["planPending",  t=>Array.isArray(t)?t.slice(-60):t],
+  /* El historial de ratios sirve para una mediana: recortarlo a la mitad
+     mantiene el punto neutro casi intacto y libera espacio, así que se poda
+     antes que la calibración, que sí necesita toda su muestra. */
+  ["ratHist",      t=>{ if(!t||typeof t!=="object"||Array.isArray(t))return t;
+                        const o={};
+                        for(const [sym,h] of Object.entries(t))
+                          o[sym]={g:Array.isArray(h&&h.g)?h.g.slice(-800):[],
+                                  tp:Array.isArray(h&&h.tp)?h.tp.slice(-800):[]};
+                        return o;}],
   ["cal",          t=>t&&Array.isArray(t.zlog)?{...t,zlog:t.zlog.slice(-1200)}:t]];
 
 function podarAlmacen(){
@@ -1717,6 +1746,73 @@ function scoreTF(o){
   return{s:tw?clamp(s/tw*strength,-1,1):0,parts:p,blocks};}
 
 /* ═══ POSICIONAMIENTO ═══ */
+/* ══════════════════════════════════════════════════════════════════════
+   PUNTO NEUTRO APRENDIDO DEL RATIO LARGOS/CORTOS
+   ──────────────────────────────────────────────────────────────────────
+   Un ratio de 2,1 no significa nada por sí solo: significa algo comparado
+   con lo NORMAL en este par. Lo normal estaba escrito a mano (1,9 para las
+   cuentas globales, 1,6 para las posiciones de los grandes) y por tanto no
+   se movía nunca, aunque el mercado sí lo hiciera.
+
+   Aquí se acumula la distribución observada —cada muestra con su marca de
+   tiempo, para no contar dos veces el mismo tramo de 5 min— y el centro
+   sale de la MEDIANA, que no se va detrás de un pico. Luego se encoge hacia
+   el valor de origen según la muestra, igual que hace Platt con la
+   probabilidad:
+
+       centro = prior + (mediana − prior) · min(n/plenaN, 1)
+
+   y el resultado se limita a ±45% del prior, para que una racha rara no
+   pueda llevarse el punto neutro a un sitio absurdo.
+
+   Con n = 0 devuelve exactamente el prior: al instalar esto, el motor se
+   comporta igual que antes y solo se separa cuando hay evidencia.
+   ══════════════════════════════════════════════════════════════════════ */
+let ratGuardas=0;
+function registrarRatios(){
+  const N=CFG.neutro, H=S.ratHist;
+  let nuevas=0;
+  const meter=(clave,filas)=>{
+    if(!Array.isArray(filas)||!filas.length)return;
+    const arr=H[clave]||(H[clave]=[]);
+    const ultimo=arr.length?arr[arr.length-1][0]:0;
+    for(const f of filas){
+      const t=+f.timestamp, v=+f.longShortRatio;
+      /* solo tramos NUEVOS: la petición devuelve las últimas 48 lecturas en
+         cada refresco y sin este filtro el mismo valor entraría decenas de
+         veces y falsearía la mediana */
+      if(!Number.isFinite(t)||!Number.isFinite(v)||v<=0||t<=ultimo)continue;
+      arr.push([t,+v.toFixed(4)]); nuevas++;}
+    if(arr.length>N.maxMuestras)H[clave]=arr.slice(-N.maxMuestras);};
+  meter("g",S.gAcc); meter("tp",S.tPos);
+  /* guardar en cada refresco sería escribir en disco cada 5 min sin motivo */
+  if(nuevas&&(++ratGuardas%N.guardaCada===0))guardarRatHist();}
+
+/* La distribución es PROPIA DE CADA PAR: WLDUSDC tiene otro público y otro
+   libro que WLDUSDT, y mezclarlas daría un punto neutro que no describe a
+   ninguno de los dos. Por eso se guarda indexada por símbolo y se recarga al
+   cambiar de par. */
+function cargarRatHist(){
+  const todo=store.get("ratHist",{});
+  const h=(todo&&typeof todo==="object"&&todo[S.sym])||null;
+  S.ratHist={g:Array.isArray(h&&h.g)?h.g:[], tp:Array.isArray(h&&h.tp)?h.tp:[]};}
+
+function guardarRatHist(){
+  const todo=store.get("ratHist",{});
+  const base=(todo&&typeof todo==="object"&&!Array.isArray(todo))?todo:{};
+  base[S.sym]=S.ratHist;
+  store.set("ratHist",base);}
+
+function centroNeutro(clave,prior){
+  const N=CFG.neutro, arr=(S.ratHist&&S.ratHist[clave])||[];
+  if(arr.length<N.minN)return prior;
+  const v=arr.map(x=>x[1]).sort((a,b)=>a-b);
+  const med=v.length%2?v[(v.length-1)/2]:(v[v.length/2-1]+v[v.length/2])/2;
+  if(!Number.isFinite(med)||med<=0)return prior;
+  const conf=clamp(arr.length/N.plenaN,0,1);
+  const c=prior+(med-prior)*conf;
+  return clamp(c,prior*(1-N.desvioMax),prior*(1+N.desvioMax));}
+
 function scorePos(){
   const parts={}, g=S.gAcc.at(-1), tp=S.tPos.at(-1), tk=S.taker.at(-1);
   const now=Date.now();
@@ -1744,8 +1840,14 @@ function scorePos(){
   const flujoVale=gate>=0.05;
   S.gateExcluye=!flujoVale;
 
-  if(derivsOk&&g)parts.crowd=-Math.tanh(((+g.longShortRatio)-1.9)/1.1);
-  if(derivsOk&&tp)parts.whale=clamp(Math.tanh(((+tp.longShortRatio)-1.6)/1.2),-1,1)*0.6;
+  /* Centro aprendido: ver CFG.neutro. `centroNeutro` devuelve el valor de
+     origen mientras no haya muestra suficiente, así que esto no cambia nada
+     hasta que la app lleve horas observando el par. */
+  const cG=centroNeutro("g",CFG.neutro.priorG);
+  const cTP=centroNeutro("tp",CFG.neutro.priorTP);
+  S.neutro={g:cG,tp:cTP,nG:(S.ratHist.g||[]).length,nTP:(S.ratHist.tp||[]).length};
+  if(derivsOk&&g)parts.crowd=-Math.tanh(((+g.longShortRatio)-cG)/1.1);
+  if(derivsOk&&tp)parts.whale=clamp(Math.tanh(((+tp.longShortRatio)-cTP)/1.2),-1,1)*0.6;
   if(derivsOk&&g&&tp)parts.diverg=clamp(((+tp.longShortRatio)-(+g.longShortRatio))/1.4,-1,1);
   if(Number.isFinite(S.funding))parts.funding=-clamp(S.funding/0.0004,-1,1);
 
@@ -3010,7 +3112,13 @@ function actualizarHawkes(){
    ══════════════════════════════════════════════════════════════════════ */
 function pushVPIN(qty,esCompra,precio){
   const V=S.vpin;
-  if(!V.tamCubo||!(V.tamCubo>0))V.tamCubo=Math.max(1,(S.vol24?S.vol24/1440:qty*50));
+  /* Semilla del cubo mientras no hay velas suficientes para `ajustarCuboVPIN`.
+     Se usa la MISMA definición que allí —volumen de una vela de 5 m dividido
+     entre `cubosPorVela`— para que el tamaño no dé un salto artificial cuando
+     el motor toma el relevo: 24 h son 288 velas de 5 m, así que el volumen de
+     una vela es vol24/288 y el del cubo, vol24/(288·cubosPorVela). */
+  if(!V.tamCubo||!(V.tamCubo>0))
+    V.tamCubo=Math.max(1,S.vol24?S.vol24/(288*CFG.vpin.cubosPorVela):qty*50);
   V.compra+=esCompra?qty:0;
   V.venta+=esCompra?0:qty;
   V.acum+=qty;
@@ -4532,7 +4640,8 @@ function buildAutoevaluacion(){
     const mov=h.px?((px-h.px)/h.px)*100:null;
     const props=S.gemTrades.filter(q=>q.anId===h.id);
     return{cuando:fechaHora(h.t),               // hora de Colombia, la que hay que citar
-      cuando_utc:new Date(h.t).toISOString(),  // solo para ordenar, NO citar
+      /* una fecha inválida hacía lanzar toISOString y tumbaba todo el snapshot */
+      cuando_utc:Number.isFinite(h.t)?new Date(h.t).toISOString():null,
       hace_horas:r(horas,1),
       /* Cuánto debe pesar este análisis HOY, por su fecha exacta. */
       peso_por_antiguedad:r(Math.pow(0.5,horas/CFG.hist.semivida.corto),3),
@@ -4568,8 +4677,16 @@ function buildAutoevaluacion(){
             "saltado. PROHIBIDO describir el resultado citando solo variacion_punto_a_punto_pct."};})(),
       acerto_la_direccion:(()=>{const j=evaluarSesgo(h,mov);return j.acerto;})(),
       juicio:evaluarSesgo(h,mov).txt,
-      probabilidad_del_motor_entonces:h.motor.prob,
-      trampa_detectada_entonces:h.motor.trampa,
+      /* BUG CORREGIDO · h.motor.prob sin comprobar que h.motor exista.
+         Un solo registro de análisis sin ese campo —guardado por una versión
+         antigua, truncado por una poda de almacenamiento o corrupto en
+         localStorage— hacía reventar buildSnapshot y contextoChat. Y como el
+         render traga los errores, el informe y el chat dejaban de funcionar
+         SIN decir por qué, de forma permanente hasta borrar el historial.
+         Lo encontró el banco de estrés: el fallo sobrevivía a restaurar todos
+         los datos de mercado, porque el veneno estaba en el historial. */
+      probabilidad_del_motor_entonces:h.motor?h.motor.prob:null,
+      trampa_detectada_entonces:h.motor?h.motor.trampa:null,
       propuestas:props.slice(0,6).map(q=>({direccion:q.dir===1?"largo":"corto",plazo:q.plazo,
         entrada:r(q.entry,5),stop:r(q.stop,5),objetivo1:r(q.t1,5),
         rr:r(q.rr1),probabilidad_que_le_diste:q.pIA,
@@ -5924,7 +6041,35 @@ function renderDeriv(){
   $("derivTable").innerHTML=`<thead><tr><th>Componente</th><th>Aporte</th></tr></thead><tbody>
     ${rows}<tr><td><b>Puntaje de posicionamiento</b></td>
     <td class="${S.pos>.05?"pos":S.pos<-.05?"neg":"neu"}"><b>${(S.pos>0?"+":"")+S.pos.toFixed(2)}</b></td>
-    </tr></tbody>`;}
+    </tr></tbody>`;
+  /* ── De dónde sale el "contrario" ──
+     Las dos primeras filas dependen de UN número: contra qué ratio se compara
+     el actual. Sin verlo, "+0,42 multitud" es un dato que hay que creerse. */
+  const nu=S.neutro, Nc=CFG.neutro, cajaNeutro=$("neutroNota");
+  if(cajaNeutro){
+    if(!nu)cajaNeutro.innerHTML="";
+    else{
+      const g2=S.gAcc.at(-1), tp2=S.tPos.at(-1);
+      const rG=g2?+g2.longShortRatio:null, rTP=tp2?+tp2.longShortRatio:null;
+      const aprendido=nu.nG>=Nc.minN;
+      const falta=Math.max(0,Nc.minN-nu.nG);
+      cajaNeutro.innerHTML=
+        `<b>Punto neutro del posicionamiento:</b> ${nu.g.toFixed(2)} para las cuentas `+
+        `minoristas y ${nu.tp.toFixed(2)} para los grandes. `+
+        (aprendido
+          ? `Aprendido de ${nu.nG} lecturas de este par —es la mediana observada, acercándose `+
+            `al ${Math.round(clamp(nu.nG/Nc.plenaN,0,1)*100)}% desde el valor de origen `+
+            `(${Nc.priorG} y ${Nc.priorTP}) según crece la muestra. `
+          : `Valor de origen: hacen falta ${falta} lecturas más de este par `+
+            `(~${Math.round(falta*5/60)} h de observación) para empezar a aprenderlo. `)+
+        (Number.isFinite(rG)
+          ? `Ahora mismo el ratio minorista está en ${rG.toFixed(2)}: `+
+            `<b>${rG>nu.g?"por encima":"por debajo"} de lo normal en este par</b>, y por eso `+
+            `la lectura contraria es ${rG>nu.g?"bajista":"alcista"}.`
+          : "")+
+        (Number.isFinite(rTP)?` El de los grandes está en ${rTP.toFixed(2)}.`:"")+
+        ` <span class="muted">Comparar contra un número fijo era el fallo: si la multitud se `+
+        `asienta meses en otro nivel, el motor lee "multitud larga" siempre y la señal deja de informar.</span>`;}}}
 
 function renderBtc(){
   const b=S.btc;
@@ -6007,12 +6152,15 @@ function renderCal(){
    ══════════════════════════════════════════════════════════════════════ */
 const CLAVES_COPIA=["cal","planCal","blockPerf","shadow","planPending","platt","lastSigT","modelPerfil","chat","gridLive","cfgAjustes",
   "gemHist","gemTrades","mejoras","labHist","pesosBloques","alerts","position","maxLev",
-  "arranques","primerUso"];
+  "arranques","primerUso",
+  /* sin esto, migrar de navegador tiraba las horas de observación que sostienen
+     el punto neutro aprendido y el motor volvía al valor de origen */
+  "ratHist","modelStats"];
 
 function exportarMemoria(){
   const datos={};
   for(const k of CLAVES_COPIA){const v=store.get(k,undefined); if(v!==undefined)datos[k]=v;}
-  const paquete={app:"IRIS", version:"5.6", exportado:fechaHora(Date.now()),
+  const paquete={app:"IRIS", version:"9.9", exportado:fechaHora(Date.now()),
     exportado_utc:new Date().toISOString(), simbolo:S.sym, datos};
   const txt=JSON.stringify(paquete);
   try{
@@ -6047,6 +6195,9 @@ function importarMemoria(txt){
   S.shadow=store.get("shadow",{n:0,win:0,pending:[],last:[]});
   S.planPending=store.get("planPending",[]);
   S.gemHist=store.get("gemHist",[]); S.gemTrades=store.get("gemTrades",[]);
+  cargarRatHist();
+  /* Saneado inmediato: un registro corrupto aquí deja sin informe ni chat. */
+  try{sanearHistorial();}catch(e){}
   S.mejoras=store.get("mejoras",[]); S.labHist=store.get("labHist",[]);
   S.diario=store.get("diario",[]);
   S.alerts=store.get("alerts",[]); S.gemScore=null;
@@ -6528,7 +6679,8 @@ function renderMarcador(){
         <span class="mono" style="font-size:10.5px;color:var(--muted)">${q.plazo} · ${hhmm(q.t)}</span>
       </div>
       <div class="mono" style="font-size:11px">
-        entrada ${f(q.entry)} · stop ${f(q.stop)} · objetivo ${f(q.t1)} · R:R ${q.rr1.toFixed(2)}
+        entrada ${f(q.entry)} · stop ${f(q.stop)} · objetivo ${f(q.t1)} · R:R ${
+          Number.isFinite(q.rr1)?q.rr1.toFixed(2):"—"}
         ${q.pIA!==null?" · dijo "+Math.round(q.pIA*100)+"%":""}${q.dirCorregida?" · dirección corregida":""}
         ${q.resueltoEn?(q.tRes?" · resuelto en ":" · se resuelve en ")+q.resueltoEn:""}</div>
       <div style="font-size:11.5px;color:${e.c};font-weight:600">${e.t}
@@ -7191,6 +7343,12 @@ async function loadMeta(){
     S.funding=+pi.lastFundingRate; S.nextFund=+pi.nextFundingTime;
     S.basis=S.index?(S.mark-S.index)/S.index:null;
     S.chg=+t24.priceChangePercent; if(!S.last)S.last=+t24.lastPrice;
+    /* BUG CORREGIDO · S.vol24 se leía en el dimensionado de los cubos del VPIN
+       y NADA lo asignaba nunca: el operador caía siempre al valor de reserva
+       (qty*50), o sea que el tamaño de cubo dependía del primer trade que
+       llegara en vez del volumen real del día. El ticker de 24 h ya traía el
+       dato en la misma respuesta y se estaba descartando. */
+    S.vol24=Number.isFinite(+t24.volume)?+t24.volume:null;
     S.fresh.meta=Date.now();
   }catch(e){S.diag.errs.loadMeta=(S.diag.errs.loadMeta||0)+1;}
   try{const sp=await get(SAPI,`/api/v3/ticker/price?symbol=WLDUSDT`); S.spot=+sp.price;}catch(e){}}
@@ -7219,6 +7377,8 @@ async function loadDerivs(){
       get(FAPI,`/futures/data/topLongShortPositionRatio?symbol=${S.sym}&period=5m&limit=48`),
       get(FAPI,`/futures/data/takerlongshortRatio?symbol=${S.sym}&period=5m&limit=48`)]);
     S.oiHist=oih;S.gAcc=g;S.tAcc=ta;S.tPos=tp;S.taker=tk;
+    /* la distribución observada alimenta el punto neutro aprendido */
+    try{registrarRatios();}catch(e){S.diag.errs.ratHist=(S.diag.errs.ratHist||0)+1;}
     S.fresh.derivs=Date.now(); dot("dPos","ok");
     /* historial de OI del par alterno: el mapa de liquidaciones se construye
        sobre el nocional agregado de los dos libros, no sobre una isla */
@@ -7749,10 +7909,25 @@ async function gemDiscover(){
       const r=await fetch(`${proxy}${GEM_HOST}${ver}/models?key=${encodeURIComponent(key)}&pageSize=200`);
       const j=await r.json().catch(()=>({}));
       if(!r.ok){errs.push(`${ver}: ${(j.error&&j.error.message)||("HTTP "+r.status)}`);continue;}
+      /* BUG CORREGIDO · se tiraban los límites que Google publica de cada modelo.
+         /models devuelve outputTokenLimit e inputTokenLimit, y la app los
+         descartaba quedándose solo con id y nombre. Después mandaba
+         maxOutputTokens de hasta 19.192 a ciegas: un modelo con un límite menor
+         respondía 400 en los cuatro peldaños, se marcaba como que "rechaza"
+         todo y quedaba fuera PARA SIEMPRE sin un solo aviso. Por eso elegías
+         3.5-flash-lite y el informe salía con 2.5-flash, mientras el chat —que
+         manda 8.192— usaba ese mismo modelo sin problema.
+         Además se excluyen los modelos que ya demostraron estar retirados: Google
+         puede seguir listándolos en /models aunque respondan 404. */
+      const muertos=store.get("modelosObsoletos",{});
       const list=(j.models||[])
         .filter(m=>(m.supportedGenerationMethods||[]).includes("generateContent"))
-        .map(m=>({id:m.name.replace(/^models\//,""),label:m.displayName||m.name}))
-        .filter(m=>!/embedding|aqa|imagen|veo|-tts|native-audio|-live-|image-generation/i.test(m.id));
+        .map(m=>({id:m.name.replace(/^models\//,""),label:m.displayName||m.name,
+          maxOut:Number.isFinite(+m.outputTokenLimit)?+m.outputTokenLimit:null,
+          maxIn:Number.isFinite(+m.inputTokenLimit)?+m.inputTokenLimit:null,
+          piensa:m.thinking===true}))
+        .filter(m=>!/embedding|aqa|imagen|veo|-tts|native-audio|-live-|image-generation/i.test(m.id))
+        .filter(m=>!muertos[m.id]);
       if(list.length){GEM_VER=ver; gemState.models=list; return list;}
       errs.push(`${ver}: la clave no expone ningún modelo de texto`);
     }catch(e){errs.push(`${ver}: ${e.message}`);}}
@@ -7787,6 +7962,19 @@ function anotarModelo(id,evento,puntos){
   m.ultimo=Date.now();
   t[id]=m; store.set("modelStats",t);}
 
+/* ══ SIN CUOTA AHORA vs SIN CUOTA NUNCA ══
+   Verificado contra la documentación de Google: 3.8, 3.7 y 3.6 Flash SIGUEN
+   existiendo, no están retirados. Lo que pasa es que el plan gratuito no les
+   asigna cuota, así que devuelven 429 siempre. La app los reintentaba en cada
+   análisis como si fueran un fallo pasajero, gastando una petición cada vez.
+   Un modelo que ha dado cuota varias veces y NUNCA ha respondido no es un
+   modelo saturado: es un modelo que tu plan no cubre. Se manda al final de la
+   cola en vez de seguir intentándolo el primero. No se borra: si algún día
+   cambias de plan, un solo éxito lo devuelve al juego. */
+function fueraDePlan(id){
+  const m=statsModelo(id);
+  return m.cuota>=4&&m.ok===0&&m.pobre===0;}
+
 /* Puntuación medida, de 0 a 100. Disponibilidad pesa más que elocuencia: un
    modelo brillante que devuelve 503 la mitad de las veces es peor herramienta
    que uno correcto que siempre contesta. */
@@ -7800,6 +7988,33 @@ function fiabilidadModelo(id){
   return{n, puntuacion:+(disponible*35+util*45+calidad*20).toFixed(1),
     disponible:+(disponible*100).toFixed(0), util:+(util*100).toFixed(0),
     calidad:+(calidad*100).toFixed(0), detalle:m};}
+
+/* ══ LÍMITES REALES Y MODELOS RETIRADOS ══ */
+function infoModelo(id){
+  const m=(gemState.models||[]).find(x=>idModelo(x)===idModelo(id));
+  return m&&typeof m==="object"?m:null;}
+
+/* Nunca pedir más salida de la que el modelo admite. Si no se conoce el límite
+   se usa 8.192, que es lo que el chat manda y funciona con todos. */
+function acotarSalida(id,pedido){
+  const m=infoModelo(id);
+  const tope=m&&Number.isFinite(m.maxOut)&&m.maxOut>0?m.maxOut:8192;
+  return Math.max(256,Math.min(pedido,tope));}
+
+/* Un modelo retirado responde 404, o 400 con un texto que lo dice. Esto separa
+   "retirado" de "petición mal formada": lo primero es permanente, lo segundo no. */
+function esRetirado(e){
+  const m=String(e&&e.message||"").toLowerCase();
+  if(e&&e.code===404)return true;
+  return /deprecat|no longer (available|supported)|retired|discontinu|sunset|has been (removed|shut)|is not found for api version|not found for api/.test(m);}
+
+function marcarObsoleto(id,motivo){
+  const t=store.get("modelosObsoletos",{});
+  t[idModelo(id)]={t:Date.now(),motivo:String(motivo||"").slice(0,160)};
+  store.set("modelosObsoletos",t);
+  gemState.models=(gemState.models||[]).filter(x=>idModelo(x)!==idModelo(id));
+  addLog(`<b>${idModelo(id)} retirado</b> · Google ya no lo sirve para tu clave. `+
+    `Sale del selector y del relevo. Motivo: ${String(motivo||"").slice(0,120)}`);}
 
 /* Orden de preferencia por capacidad, no por nombre fijo.
    BUG CORREGIDO · la tabla de versiones estaba escrita a mano: 2.5 valía 60,
@@ -7834,11 +8049,29 @@ function gemPick(list){
     return s;};
   return [...list].sort((a,b)=>rank(b.id)-rank(a.id))[0];}
 
+/* ══ BUG CORREGIDO · TU ELECCIÓN SE SOBRESCRIBÍA AL RECARGAR ══
+   Al arrancar, el selector solo tiene las cuatro opciones del HTML. La app
+   hacía sel.value="gemini-3.5-flash-lite", pero esa opción aún no existía, así
+   que el navegador IGNORA la asignación en silencio y el valor se queda en la
+   primera opción: gemini-2.5-flash. Luego, al cargar los modelos reales, esta
+   función tomaba prev=sel.value —o sea 2.5-flash— y lo GUARDABA encima de tu
+   elección. Cada recarga te devolvía a 2.5-flash sin avisar.
+   Es el mismo fallo que ya se documentó con otra forma: guardar un nombre que
+   no está entre las opciones del selector.
+   Ahora manda lo que TÚ guardaste, no lo que el selector pudo aceptar. */
 function gemFillModels(list,keep){
-  const sel=$("gemModel"), prev=keep||sel.value;
+  const sel=$("gemModel");
+  const guardado=store.get("gemModel",null);
+  const prev=keep||guardado||sel.value;
   sel.innerHTML=list.map(m=>`<option value="${m.id}">${m.label}</option>`).join("");
-  if(list.some(m=>m.id===prev))sel.value=prev;
-  else{const best=gemPick(list); if(best)sel.value=best.id;}
+  if(list.some(m=>m.id===prev)){sel.value=prev;}
+  else{
+    const best=gemPick(list);
+    if(best)sel.value=best.id;
+    /* Solo se reemplaza tu elección si tu modelo ya NO existe, y se dice. */
+    if(prev&&best&&prev!==best.id)
+      addLog(`<b>${prev}</b> ya no está disponible para tu clave · se seleccionó `+
+        `<b>${best.id}</b>. Elige otro en la sección 03 si prefieres.`);}
   store.set("gemModel",sel.value);
   return sel.value;}
 
@@ -8332,6 +8565,18 @@ function buildSnapshot(){
       pct_cuentas_largas:g?r(+g.longAccount*100,1):null,
       ls_top_cuentas:ta?r(+ta.longShortRatio,2):null,
       ls_top_posicion:tp?r(+tp.longShortRatio,2):null,
+      /* Sin esto, el informe compara el ratio contra "1,0 = equilibrio", que es
+         falso: en un perpetuo de alta capitalizacion el minorista esta
+         estructuralmente largo y lo normal vive muy por encima de 1. */
+      punto_neutro_del_par:S.neutro?{
+        cuentas_minoristas:r(S.neutro.g,2),
+        grandes_por_posicion:r(S.neutro.tp,2),
+        lecturas_acumuladas:S.neutro.nG,
+        aprendido:S.neutro.nG>=CFG.neutro.minN,
+        nota:"Es la mediana observada en ESTE par, no 1,0. Un ratio por encima "+
+          "de este numero es multitud mas larga de lo normal y la lectura "+
+          "contraria es bajista; por debajo, al reves. Mientras no haya "+
+          CFG.neutro.minN+" lecturas se usa el valor de origen "+CFG.neutro.priorG+"."}:null,
       agresor_compra_venta:tk?r(+tk.buySellRatio,2):null,
       regimen_precio_oi:S.oiState?{cambio_precio_pct:r(S.oiState.dP*100,2),
         cambio_oi_pct:r(S.oiState.dOi*100,2)}:null,
@@ -9015,6 +9260,45 @@ function clasificarError(e){
 /* Limpia entradas corruptas: la v5.7 guardaba perfiles bajo la clave
    "[object Object]" porque metía objetos donde iban ids, y esos perfiles
    sobreviven en el almacenamiento y salen en el diagnóstico. */
+/* ══════════════════════════════════════════════════════════════════════
+   SANEADO DEL HISTORIAL
+   El banco de estrés demostró que UN SOLO registro mal formado —sin fecha
+   válida, sin bloque motor, con una probabilidad fuera de rango— hace reventar
+   buildSnapshot y contextoChat. Y como el render traga los errores, el informe
+   y el chat dejan de funcionar sin decir por qué, de forma permanente, hasta
+   borrar el historial a mano.
+   Un registro así entra con facilidad: lo guarda una versión antigua, lo trunca
+   una poda de almacenamiento, o el JSON se corta a medias al llenarse la cuota.
+   Igual que sanearPerfiles limpia los perfiles corruptos al arrancar, esto
+   limpia el historial: normaliza lo que se puede y descarta lo que no sirve.
+   ══════════════════════════════════════════════════════════════════════ */
+function sanearHistorial(){
+  const valido=t=>Number.isFinite(t)&&t>1577836800000&&t<Date.now()+864e5; // >2020 y no futuro
+  let quitados=0, arreglados=0;
+  const hs=(S.gemHist||[]).filter(h=>{
+    if(!h||typeof h!=="object"||!h.id){quitados++;return false;}
+    if(!valido(h.t)){quitados++;return false;}
+    if(!h.motor||typeof h.motor!=="object"){h.motor={}; arreglados++;}
+    if(!Number.isFinite(h.px))h.px=null;
+    return true;});
+  const ids=new Set(hs.map(h=>h.id));
+  const tr=(S.gemTrades||[]).filter(q=>{
+    if(!q||typeof q!=="object"){quitados++;return false;}
+    if(!valido(q.t)){quitados++;return false;}
+    /* una propuesta huérfana no se puede atribuir a ningún análisis */
+    if(q.anId&&!ids.has(q.anId)&&(S.gemHist||[]).length){quitados++;return false;}
+    if(!Number.isFinite(q.pIA)||q.pIA<0||q.pIA>1){q.pIA=null; arreglados++;}
+    if(!Number.isFinite(q.rr1))q.rr1=null;
+    if(!Number.isFinite(q.resultadoR))q.resultadoR=null;
+    return true;});
+  if(quitados||arreglados){
+    S.gemHist=hs; S.gemTrades=tr;
+    store.set("gemHist",hs); store.set("gemTrades",tr);
+    addLog(`<b>Historial saneado</b> · ${quitados} registro${quitados===1?"":"s"} inservible${quitados===1?"":"s"} `+
+      `y ${arreglados} campo${arreglados===1?"":"s"} corregido${arreglados===1?"":"s"}. `+
+      `Un registro corrupto bastaba para dejar sin informe ni chat.`);}
+  return{quitados,arreglados};}
+
 function sanearPerfiles(){
   const p=store.get("modelPerfil",{});
   let sucio=false;
@@ -9091,6 +9375,8 @@ const FAMILIAS=[
    cualquier desconocido, y uno por debajo de 50 se queda detrás. Lo probado
    manda, y lo desconocido solo se prueba cuando lo probado es malo. */
 function rangoModelo(m){
+  /* Sin cuota en tu plan: al final de todo, pero antes que lo retirado. */
+  if(fueraDePlan(m))return 9.5;
   const f=fiabilidadModelo(m);
   if(f)return clamp(10-(f.puntuacion/10),0,10);
   let orden=FAMILIAS.length;
@@ -9186,7 +9472,9 @@ async function gemAnalyze(){
     const gc={temperature:0.32, topP:0.92,
       /* Un tope de 32.768 no acelera nada y con modelos que razonan invita a
          gastar presupuesto. El informe completo cabe de sobra en 20k. */
-      maxOutputTokens:esencial?Math.min(12000,7000+think*2):Math.min(20000,11000+think*2),
+      /* Acotado al límite REAL del modelo que Google publica en /models. */
+      maxOutputTokens:acotarSalida(modelo,
+        esencial?Math.min(12000,7000+think*2):Math.min(20000,11000+think*2)),
       responseMimeType:"application/json"};
     if(esquema)gc.responseSchema=esquema;
     if(/2\.5|thinking/.test(modelo)&&think>0)gc.thinkingConfig={thinkingBudget:think};
@@ -9227,14 +9515,34 @@ async function gemAnalyze(){
   let raw=null, usado=null, modeloUsado=null;
   const errores=[];
 
+  const saltadosEnSilencio=[];
   for(const modelo of modelos){
     const perfil=perfilModelo(modelo);
+    /* ══ BUG CORREGIDO · EL RECHAZO ERA PERMANENTE ══
+       Un 400 en un peldaño lo añadía a perfil.rechaza y NADA lo quitaba nunca.
+       Con los cuatro peldaños rechazados, este bucle los saltaba sin llamar a
+       Google ni una vez y pasaba al siguiente modelo, sin aviso. Un 400 causado
+       por un parámetro —como un maxOutputTokens por encima del límite— dejaba el
+       modelo inutilizado para siempre aunque el parámetro se corrigiera después.
+       Ahora el rechazo caduca a las 6 horas, y los perfiles antiguos sin fecha
+       se tratan como caducados: el tuyo de 3.5-flash-lite se desbloquea solo. */
+    const RECHAZO_MS=6*3600000;
+    const rechazoVigente=perfil.rechazaT&&(Date.now()-perfil.rechazaT)<RECHAZO_MS;
+    const rechazados=rechazoVigente?(perfil.rechaza||[]):[];
+    const esElegido=idModelo(modelo)===idModelo(elegido);
+    /* El modelo que TÚ elegiste nunca se salta sin intentarlo: si tuviera todo
+       rechazado, se prueba igualmente con el peldaño más ligero. */
+    const todoRechazado=PELDANOS.every(p=>rechazados.includes(p.n));
     /* arranca por el peldaño que este modelo ya aceptó otras veces */
     let i=0;
     if(perfil.ok){const k=PELDANOS.findIndex(p=>p.n===perfil.ok); if(k>0)i=k;}
+    if(esElegido&&todoRechazado)i=PELDANOS.length-1;
+    if(!esElegido&&todoRechazado){
+      saltadosEnSilencio.push(modelo);
+      continue;}
     while(i<PELDANOS.length){
       const p=PELDANOS[i];
-      if(perfil.rechaza.includes(p.n)){i++;continue;}   // ya sabemos que este modelo lo rechaza
+      if(rechazados.includes(p.n)&&!(esElegido&&todoRechazado)){i++;continue;}
       let body;
       try{body=p.b(modelo);}catch(e){i++;continue;}
       gemBusy(true,`${modelo} · ${p.n} · ${kb(body)} KB`);
@@ -9242,22 +9550,35 @@ async function gemAnalyze(){
         /* ante capacidad no insistimos 3 veces: cambiar de modelo es más rápido */
         raw=await gemCall(body,modelo,120000,2);
         usado=p.n; modeloUsado=modelo;
-        guardarPerfil(modelo,{ok:p.n,exitos:perfil.exitos+1,saturadoHasta:0});
+        /* Éxito: el modelo acepta este peldaño, así que su historial de
+           rechazos deja de tener sentido. */
+        guardarPerfil(modelo,{ok:p.n,exitos:perfil.exitos+1,saturadoHasta:0,
+          rechaza:[],rechazaT:0});
+        /* El informe también alimenta la tabla de fiabilidad: antes solo lo
+           hacía el chat, así que la tabla no reflejaba el uso real. */
+        anotarModelo(modelo,"ok",70);
         break;
       }catch(e){
         const tipo=clasificarError(e);
         errores.push({modelo,peldano:p.n,tipo,msg:e.message});
         if(tipo==="permiso"||tipo==="red"){i=PELDANOS.length;break;}
+        if(esRetirado(e)){
+          /* retirado por Google: permanente, fuera del selector y del relevo */
+          marcarObsoleto(modelo,e.message);
+          anotarModelo(modelo,"err");
+          i=PELDANOS.length; break;}
         if(tipo==="peticion"){
-          /* la petición es el problema: recordar y bajar un peldaño */
-          guardarPerfil(modelo,{rechaza:[...new Set([...perfil.rechaza,p.n])],
-            fallos:perfil.fallos+1});
+          /* la petición es el problema: recordar CON FECHA y bajar un peldaño */
+          guardarPerfil(modelo,{rechaza:[...new Set([...rechazados,p.n])],
+            rechazaT:Date.now(),fallos:perfil.fallos+1});
+          anotarModelo(modelo,"err");
           i++; continue;}
         if(tipo==="capacidad"||tipo==="cuota"){
           /* el modelo no da abasto: degradar la petición no arregla nada */
           guardarPerfil(modelo,{saturadoHasta:Date.now()+
             (esperaDeError(e)||(tipo==="cuota"?600000:180000)),
             fallos:perfil.fallos+1});
+          anotarModelo(modelo,"cuota");
           i=PELDANOS.length; break;}
         if(tipo==="no_existe"){
           try{gemFillModels(await gemDiscover());}catch(e2){}
@@ -9323,10 +9644,20 @@ async function gemAnalyze(){
   const MOTIVO={capacidad:"saturado (Google devolvió 5xx)",cuota:"cuota agotada",
     peticion:"rechazó la petición",permiso:"tu clave no tiene permiso sobre él",
     no_existe:"ya no existe con ese nombre",red:"sin conexión",otro:"error desconocido"};
-  const cambioModelo=modeloUsado!==elegido
-    ? ` · <span style="color:var(--amber)">${elegido} ${falloElegido
-        ?MOTIVO[falloElegido.tipo]||falloElegido.tipo
-        :"no estaba disponible"}, usé ${modeloUsado}</span>`
+  /* "no estaba disponible" era el texto por defecto cuando el elegido ni
+     siquiera se intentaba, así que mentía: el modelo sí estaba, se saltaba por
+     un rechazo antiguo. Ahora se dice el motivo real, o que se saturó y cedió
+     el turno, y se da el mensaje literal de Google cuando lo hay. */
+  const saturadoElegido=perfilModelo(idModelo(elegido)).saturadoHasta>Date.now();
+  const cambioModelo=idModelo(modeloUsado)!==idModelo(elegido)
+    ? ` · <span style="color:var(--amber)">${idModelo(elegido)} `+
+      (falloElegido
+        ? `${MOTIVO[falloElegido.tipo]||falloElegido.tipo}`+
+          (falloElegido.msg?` («${String(falloElegido.msg).slice(0,90)}»)`:"")
+        : saturadoElegido
+        ? `estaba saturado y cedió el turno`
+        : `no respondió`)+
+      `, usé ${modeloUsado}</span>`
     : "";
   const cambioPeldano=usado!==PELDANOS[0].n?` · con ${usado}`:"";
   gemBusy(false,`<span style="color:var(--green)">Análisis generado con ${modeloUsado}`+
@@ -9334,7 +9665,9 @@ async function gemAnalyze(){
     `${f(gemState.snap.contexto.precio)}</span>`);
   addLog(`Análisis Gemini · ${modeloUsado} · ${usado}`+
     (errores.length?` · tras ${errores.length} fallo${errores.length===1?"":"s"}: `+
-      errores.map(e=>`${e.modelo} ${e.tipo}`).join(", "):""));}
+      errores.map(e=>`${e.modelo} ${e.tipo}`).join(", "):"")+
+    (saltadosEnSilencio.length?` · saltados por rechazo reciente: ${saltadosEnSilencio.join(", ")}`:""));
+  renderModelStats();}
 
 /* ══════════════════════════════════════════════════════════════════════
    AUDITOR IA · separado del analista.
@@ -10134,7 +10467,7 @@ async function gemAsk(){
     if(restante()<8000){
       errores.push(`sin tiempo: ${modelos.length} modelos no caben en ${PRESUPUESTO_MS/1000}s`);
       break;}
-    const gc={temperature:0.35, maxOutputTokens:8192};
+    const gc={temperature:0.35, maxOutputTokens:acotarSalida(modelo,8192)};
     if(/2\.5|thinking/.test(modelo))gc.thinkingConfig={thinkingBudget:0};
     const body={systemInstruction:{parts:[{text:CHAT_SYS}]},
       contents:[ctx,ack,...previos,{role:"user",parts:[{text:q}]}],
@@ -10158,6 +10491,7 @@ async function gemAsk(){
       continue;
     }catch(e){
       const tipo=clasificarError(e);
+      if(esRetirado(e)){marcarObsoleto(modelo,e.message); errores.push(`${modelo}: retirado`); continue;}
       anotarModelo(modelo,(tipo==="cuota"||tipo==="capacidad")?"cuota":"err");
       errores.push(`${modelo}: ${tipo}`);
       if(tipo==="capacidad"||tipo==="cuota"){
@@ -10660,6 +10994,9 @@ $("symSel").onchange=async e=>{S.sym=e.target.value; store.set("sym",S.sym);
   S.ofi={b:null,B:0,a:null,A:0,serie:[],acum:0,suma:0,z:0,n:0,t:0};
   S.liqs=[];S.liqLong=0;S.liqShort=0;S.liqBuckets=[];S.tape=[];S.wallTrack={};
   S.cvdLead=0;S.cvdLeadSeries=[];S.leadSym=null;
+  /* el punto neutro aprendido es propio de cada par: se recarga el suyo en vez
+     de seguir puntuando con la distribución del par anterior */
+  cargarRatHist(); S.neutro=null;
   S.prevDir=null; addLog(`Símbolo → <b>${S.sym}</b>`); connectWS(); await fullRefresh();
   connectLeadWS(); await loadSymbolInfo(); renderGrid();};
 $("tfSel").onchange=async e=>{S.tf=e.target.value; store.set("tf",S.tf);
@@ -10747,11 +11084,99 @@ window.confirmarAplicada=confirmarAplicada;
 (()=>{const dl=$("rutasAjustables"); if(dl)dl.innerHTML=RUTAS_AJUSTABLES
   .map(([r,d])=>`<option value="${r}">${d}</option>`).join("");})();
 window.aplicarRecalibracion=aplicarRecalibracion;
+/* ══════════════════════════════════════════════════════════════════════
+   VERIFICADOR DE MODELOS
+   /models dice qué modelos EXISTEN para tu clave, no cuáles RESPONDEN. Google
+   sigue listando modelos retirados durante un tiempo, y por eso 3.8, 3.7 y 3.6
+   flash aparecían en el selector aunque ya no sirvieran.
+   Esto hace una llamada real y mínima a cada uno —una palabra de respuesta,
+   sin razonamiento— y mide si contesta, cuánto tarda y cuál es su límite de
+   salida. Los retirados se eliminan solos. Gasta una petición por modelo, así
+   que solo se ejecuta cuando lo pides, nunca en cada análisis.
+   ══════════════════════════════════════════════════════════════════════ */
+async function verificarModelos(){
+  const box=$("verifBox"); if(!box)return;
+  if(!$("gemKey").value.trim()){box.innerHTML=`<div class="warnbox">Falta la clave de Gemini.</div>`;return;}
+  box.innerHTML=`<div class="note">Leyendo la lista de modelos de tu clave…</div>`;
+  let lista;
+  try{lista=await gemDiscover();}
+  catch(e){box.innerHTML=`<div class="warnbox">${e.message}</div>`;return;}
+  const candidatos=lista.filter(m=>!EXCLUIR_RELEVO.test(idModelo(m)));
+  const res=[];
+  for(let k=0;k<candidatos.length;k++){
+    const m=candidatos[k], id=idModelo(m);
+    box.innerHTML=`<div class="note">Probando ${k+1} de ${candidatos.length}: <b>${id}</b>…</div>`;
+    const t0=Date.now();
+    let estado="ok", detalle="";
+    try{
+      const r=await fetch(gemUrl(id,"generateContent"),{method:"POST",
+        headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({contents:[{role:"user",parts:[{text:"Responde solo: OK"}]}],
+          generationConfig:{maxOutputTokens:16,temperature:0}})});
+      const txt=await r.text();
+      let msg=""; try{const j=JSON.parse(txt); msg=(j.error&&j.error.message)||"";}catch(e){}
+      if(!r.ok){
+        const err=new Error(msg||("HTTP "+r.status)); err.code=r.status;
+        if(esRetirado(err)){estado="retirado"; marcarObsoleto(id,msg||("HTTP "+r.status));}
+        else if(r.status===429){estado="cuota"; detalle=msg.slice(0,80);
+          guardarPerfil(id,{saturadoHasta:Date.now()+(esperaDeError(err)||120000)});}
+        else if(r.status>=500){estado="saturado"; detalle=msg.slice(0,80);}
+        else {estado="rechaza"; detalle=msg.slice(0,80);}
+        anotarModelo(id,estado==="cuota"||estado==="saturado"?"cuota":"err");}
+      else {
+        /* Contesta: se limpian los rechazos antiguos, que ya no significan nada */
+        guardarPerfil(id,{rechaza:[],rechazaT:0,saturadoHasta:0});
+        anotarModelo(id,"ok",70);}
+    }catch(e){estado="red"; detalle=e.message.slice(0,80);}
+    res.push({id,estado,ms:Date.now()-t0,maxOut:m.maxOut,detalle});
+    /* pausa entre llamadas: no disparar el límite de peticiones por minuto */
+    await new Promise(r=>setTimeout(r,1200));}
+
+  const ok=res.filter(r=>r.estado==="ok");
+  const ret=res.filter(r=>r.estado==="retirado");
+  const icono={ok:"✓",retirado:"✕",cuota:"⏳",saturado:"⏳",rechaza:"!",red:"?"};
+  const txtEstado={ok:"responde",retirado:"retirado",cuota:"sin cuota ahora",
+    saturado:"saturado ahora",rechaza:"rechaza la petición",red:"sin red"};
+  box.innerHTML=`
+    <div class="${ok.length?"okbox":"warnbox"}"><b>${ok.length} de ${res.length} modelos responden
+      con tu clave.</b>${ret.length?` ${ret.length} retirado${ret.length===1?"":"s"} y eliminado${ret.length===1?"":"s"} del selector.`:""}
+      ${ok.length?`<br>El más rápido: <b>${ok.slice().sort((a,b)=>a.ms-b.ms)[0].id}</b>.`:""}</div>
+    <div style="overflow-x:auto"><table class="tbl">
+      <thead><tr><th></th><th>Modelo</th><th>Estado</th><th>ms</th><th>Salida máx.</th></tr></thead>
+      <tbody>${res.map(r=>`<tr>
+        <td>${icono[r.estado]}</td><td class="mono">${r.id}</td>
+        <td class="${r.estado==="ok"?"pos":r.estado==="retirado"?"neg":""}">${txtEstado[r.estado]}
+          ${r.detalle?`<br><span style="color:var(--muted);font-size:10px">${r.detalle}</span>`:""}</td>
+        <td>${r.estado==="ok"?r.ms:"—"}</td>
+        <td>${Number.isFinite(r.maxOut)?r.maxOut.toLocaleString("es-CO"):"—"}</td></tr>`).join("")}
+      </tbody></table></div>
+    <div class="note">«Sin cuota» y «saturado» son temporales: el modelo existe y volverá.
+      «Retirado» es permanente y ya no aparece en el selector. La columna de salida máxima es la
+      que Google publica, y la app ya no pide nunca más que eso.</div>`;
+  gemFillModels(gemState.models, $("gemModel").value);
+  renderModelStats();
+  addLog(`<b>Verificación de modelos</b> · ${ok.length}/${res.length} responden`+
+    (ret.length?` · retirados: ${ret.map(r=>r.id).join(", ")}`:""));}
+
+/* Limpia los perfiles aprendidos: rechazos, saturaciones y retirados. Para
+   cuando Google cambia su catálogo y lo aprendido deja de ser cierto. */
+function limpiarPerfilesModelos(){
+  store.del("modelPerfil"); store.del("modelosObsoletos");
+  addLog("Perfiles de modelos borrados: rechazos, saturaciones y retirados. "+
+    "Pulsa «Verificar modelos» para volver a medirlos.");
+  const box=$("verifBox");
+  if(box)box.innerHTML=`<div class="note">Perfiles borrados. Verifica los modelos para volver
+    a medir cuáles responden.</div>`;}
+
 /* Lo que la app ha aprendido sobre cada modelo con ESTA clave. */
 function renderModelStats(){
   const box=$("modelStatsBox"); if(!box)return;
   const t=store.get("modelStats",{});
-  const ids=Object.keys(t);
+  /* La tabla arrastraba el historial de modelos que no son de chat
+     (deep-research, antigravity, robotics…) y de los retirados. Se ocultan:
+     siguen en el almacén, pero no son candidatos y solo confundían. */
+  const muertos=store.get("modelosObsoletos",{});
+  const ids=Object.keys(t).filter(id=>!EXCLUIR_RELEVO.test(id)&&!muertos[id]);
   if(!ids.length){box.innerHTML=`<div class="note">Sin historial de modelos todavía.
     A partir de cinco llamadas, la app deja de elegir por heurística y empieza a elegir por lo
     que de verdad le funciona a tu clave.</div>`; return;}
@@ -10761,12 +11186,19 @@ function renderModelStats(){
     <div style="overflow-x:auto"><table class="tbl">
     <thead><tr><th>Modelo</th><th>n</th><th>Contesta</th><th>Sirve</th><th>Calidad</th><th>Puntos</th></tr></thead>
     <tbody>${filas.map(r=>`<tr>
-      <td class="mono">${r.id}</td>
+      <td class="mono">${r.id}${fueraDePlan(r.id)
+        ?`<br><span style="color:var(--amber);font-size:10px">sin cuota en tu plan</span>`:""}</td>
       <td>${r.m.ok+r.m.err+r.m.cuota+r.m.pobre}</td>
       <td>${r.f?r.f.disponible+"%":"—"}</td>
       <td class="${r.f&&r.f.util>60?"pos":"neg"}">${r.f?r.f.util+"%":"—"}</td>
       <td>${r.f?r.f.calidad+"%":"—"}</td>
       <td><b>${r.f?r.f.puntuacion:"—"}</b></td></tr>`).join("")}</tbody></table></div>
+    ${filas.some(r=>fueraDePlan(r.id))?`<div class="note"><b>Sin cuota en tu plan:</b>
+      ${filas.filter(r=>fueraDePlan(r.id)).map(r=>r.id).join(", ")}. Verificado contra la
+      documentación de Google: esos modelos existen y no están retirados, pero el plan gratuito
+      no les asigna cuota, así que devuelven 429 siempre. La app los manda al final de la cola en
+      vez de gastar una petición con ellos en cada análisis. Si algún día cambias de plan, un solo
+      éxito los devuelve al juego.</div>`:""}
     <div class="note">«Contesta» es cuántas veces devolvió algo; «sirve», cuántas pasaron la puerta
       de calidad. Con cinco llamadas o más, el orden de elección y el de relevo salen de esta
       tabla y no de una heurística escrita a mano. La disponibilidad pesa más que la elocuencia:
@@ -10963,6 +11395,14 @@ $("wsDiagReset").onclick=()=>{
   fijarWS(WS_CANDIDATOS[0].id);};
 window.renderDiario=renderDiario;
 window.borrarStatsModelos=borrarStatsModelos;
+window.verificarModelos=verificarModelos;
+window.limpiarPerfilesModelos=limpiarPerfilesModelos;
+$("verifRun").onclick=async()=>{
+  const b=$("verifRun"); b.disabled=true; b.textContent="Verificando…";
+  try{await verificarModelos();}
+  catch(e){$("verifBox").innerHTML=`<div class="warnbox">${e.message}</div>`;}
+  b.disabled=false; b.textContent="Verificar modelos";};
+$("perfilReset").onclick=limpiarPerfilesModelos;
 window.renderModelStats=renderModelStats;
 window.renderAlmacen=renderAlmacen;
 renderGuia(); renderBf(); renderDiario(); renderModelStats(); renderAlmacen();
@@ -11134,6 +11574,13 @@ $("chatClear").onclick=()=>{S.chat=[];store.del("chat");pintarChat();chatEstado(
 window.preguntarRapido=preguntarRapido;
 ["gemKey","gemModel","gemThink","gemProxy","groqKey","groqModel","iaProveedor"].forEach(id=>{
   const el=$(id), sv=store.get(id,null);
+  /* Un <select> ignora en silencio un valor que no está entre sus opciones.
+     Se crea la opción antes de asignarlo, para que tu elección sobreviva a la
+     recarga en vez de caer en la primera opción del HTML. */
+  if(sv!==null&&el&&el.tagName==="SELECT"&&
+     ![...el.options].some(o=>o.value===sv)){
+    const op=document.createElement("option");
+    op.value=sv; op.textContent=sv; el.appendChild(op);}
   if(sv!==null)el.value=sv;
   el.addEventListener("change",()=>store.set(id,el.value));
   el.addEventListener("input",()=>store.set(id,el.value));});
@@ -11254,7 +11701,7 @@ document.addEventListener("visibilitychange",()=>{if(!document.hidden)fullRefres
   setTab(store.get("tab","mesa"));
   document.querySelectorAll("#horizonSeg button").forEach(b=>
     b.classList.toggle("act",b.dataset.h===S.horizon));
-  addLog("IRIS v7.1 iniciado · conectando perp, spot y par rector");
+  addLog("IRIS v9.9 iniciado · conectando perp, spot y par rector");
   connectWS(); connectSpotWS(); await fullRefresh(); connectLeadWS();
   loadSymbolInfo().then(()=>renderGrid());
   S.macroEv=store.get("macroEventos",null);
